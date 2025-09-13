@@ -9,6 +9,12 @@ import (
 // HandlerFunc is the standard HTTP handler function signature using context.Context
 type HandlerFunc func(w http.ResponseWriter, r *http.Request) error
 
+// Middleware represents a standard middleware function
+type Middleware func(next http.Handler) http.Handler
+
+// MiddlewareFunc is a function that can be converted to Middleware
+type MiddlewareFunc func(w http.ResponseWriter, r *http.Request, next http.HandlerFunc)
+
 // Router handles HTTP routing with path parameters
 type Router struct {
 	routes map[string]map[string]*route
@@ -97,6 +103,23 @@ func (app *App) After(handler HandlerFunc) {
 	app.after = append(app.after, handler)
 }
 
+// Use adds a standard middleware to the application
+func (app *App) Use(middleware Middleware) {
+	app.middlewares = append(app.middlewares, middleware)
+}
+
+// UseFunc adds a middleware function to the application
+func (app *App) UseFunc(fn MiddlewareFunc) {
+	middleware := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fn(w, r, func(w http.ResponseWriter, r *http.Request) {
+				next.ServeHTTP(w, r)
+			})
+		})
+	}
+	app.Use(middleware)
+}
+
 // Group creates a new route group with a common prefix
 func (app *App) Group(prefix string) *Group {
 	return &Group{
@@ -183,6 +206,29 @@ func (g *Group) addRoute(method, pattern string, handler HandlerFunc) {
 
 // ServeHTTP implements the http.Handler interface
 func (app *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// If we have standard middlewares, chain them
+	if len(app.middlewares) > 0 {
+		// Create the final handler
+		final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			app.serveLegacy(w, r)
+		})
+
+		// Chain middlewares in reverse order
+		handler := http.Handler(final)
+		for i := len(app.middlewares) - 1; i >= 0; i-- {
+			handler = app.middlewares[i](handler)
+		}
+
+		handler.ServeHTTP(w, r)
+		return
+	}
+
+	// Fallback to legacy behavior
+	app.serveLegacy(w, r)
+}
+
+// serveLegacy handles the original Before/After middleware pattern
+func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
 	// Wrap the response writer
 	rw := NewResponseWriter(w)
 

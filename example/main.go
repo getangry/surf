@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"time"
 
 	"github.com/getangry/surf"
 )
@@ -13,17 +14,20 @@ func main() {
 	// Create a new Surf app
 	app := surf.NewApp()
 
-	// Global middleware - runs before all routes
-	app.Before(func(w http.ResponseWriter, r *http.Request) error {
-		log.Printf("Request: %s %s", r.Method, r.URL.Path)
-		return nil
-	})
+	// Add request ID middleware using new standard pattern
+	app.Use(surf.RequestIDMiddleware("api"))
 
-	// Global after middleware - log response metrics
-	app.After(func(w http.ResponseWriter, r *http.Request) error {
-		// Access response metrics using the custom ResponseWriter
-		if rw := surf.GetResponseWriter(r); rw != nil {
-			log.Printf("Response: %d - %d bytes", rw.Status(), rw.Size())
+	// Add logging middleware using new standard pattern
+	app.Use(surf.LoggingMiddleware("{method} {path} {status} {latency_ms}ms id:{$request_id} user:{$user_id}"))
+
+	// Example: Auth middleware that sets user context
+	app.Before(func(w http.ResponseWriter, r *http.Request) error {
+		// Simulate auth check
+		if auth := r.Header.Get("Authorization"); auth != "" {
+			// Workaround: set directly in global storage since framework doesn't preserve context
+			surf.Store(r, "user_id", "user-123")
+			surf.Store(r, "user_role", "admin")
+			surf.Store(r, "tenant_id", "tenant-456")
 		}
 		return nil
 	})
@@ -56,6 +60,12 @@ func main() {
 
 	// API routes
 	api.Get("/users", func(w http.ResponseWriter, r *http.Request) error {
+		// Add custom logging context using ResponseWriter
+		if rw, ok := w.(*surf.ResponseWriter); ok {
+			rw.Set("operation", "list_users")
+			rw.Set("items_count", 2)
+		}
+
 		users := []map[string]string{
 			{"id": "1", "name": "Alice"},
 			{"id": "2", "name": "Bob"},
@@ -65,6 +75,12 @@ func main() {
 
 	api.Get("/users/:id", func(w http.ResponseWriter, r *http.Request) error {
 		id := surf.Param(r, "id")
+
+		// Add context for this specific request
+		surf.Store(r, "operation", "get_user")
+		surf.Store(r, "target_user", id)
+		surf.Store(r, "cache_hit", false)
+
 		user := map[string]string{
 			"id":   id,
 			"name": "User " + id,
@@ -77,6 +93,13 @@ func main() {
 		if err := json.NewDecoder(r.Body).Decode(&user); err != nil {
 			return err
 		}
+
+		// Simulate processing time for logging
+		time.Sleep(10 * time.Millisecond)
+
+		surf.Store(r, "operation", "create_user")
+		surf.Store(r, "new_user_name", user["name"])
+
 		user["id"] = "3"
 		w.WriteHeader(http.StatusCreated)
 		return json.NewEncoder(w).Encode(user)
@@ -110,30 +133,49 @@ func main() {
 			http.Error(w, "Unauthorized", http.StatusUnauthorized)
 			return fmt.Errorf("unauthorized access")
 		}
-		log.Println("Admin request authenticated")
-		return nil
-	})
 
-	// Log admin response details
-	admin.After(func(w http.ResponseWriter, r *http.Request) error {
-		// Demonstrate accessing ResponseWriter directly
-		if rw, ok := w.(*surf.ResponseWriter); ok {
-			log.Printf("Admin response: status=%d, size=%d bytes, written=%v",
-				rw.Status(), rw.Size(), rw.Written())
-		}
+		// Set admin context for logging
+		surf.Store(r, "user_type", "admin")
+		surf.Store(r, "auth_method", "bearer_token")
+		surf.Store(r, "permission_level", "high")
+
 		return nil
 	})
 
 	admin.Get("/dashboard", func(w http.ResponseWriter, r *http.Request) error {
+		surf.Store(r, "operation", "view_dashboard")
 		w.Write([]byte("Admin Dashboard"))
 		return nil
 	})
 
 	admin.Delete("/users/:id", func(w http.ResponseWriter, r *http.Request) error {
 		id := surf.Param(r, "id")
+		surf.Store(r, "operation", "delete_user")
+		surf.Store(r, "target_user", id)
+		surf.Store(r, "danger_level", "high")
 		w.Write([]byte(fmt.Sprintf("User %s deleted", id)))
 		return nil
 	})
+
+	// Example of different log formats you could use:
+	/*
+		Common format examples:
+
+		// Apache-style combined log
+		"{remote_addr} - {$user_id} [{timestamp}] \"{method} {path} {proto}\" {status} {size} \"{referer}\" \"{user_agent}\""
+
+		// Simple format
+		"{method} {path} {status} {latency_ms}ms"
+
+		// Structured format with custom fields
+		"{method} {path} {status} {latency_ms}ms user:{$user_id} op:{$operation} req:{$request_id}"
+
+		// JSON-like format (could be enhanced to output actual JSON)
+		"method={method} path={path} status={status} latency={latency_ms}ms user_id={$user_id} operation={$operation}"
+
+		// Performance-focused format
+		"{method} {path} {status} {latency_ms}ms size={size}b"
+	*/
 
 	// Start the server
 	log.Println("Server starting on :8080")

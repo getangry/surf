@@ -5,15 +5,18 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"time"
 )
 
-// ResponseWriter wraps http.ResponseWriter to track response metrics
+// ResponseWriter wraps http.ResponseWriter to track response metrics and store custom data
 type ResponseWriter struct {
 	http.ResponseWriter
 	status      int
 	size        int
 	written     bool
 	wroteHeader bool
+	startTime   time.Time
+	customData  map[string]interface{}
 }
 
 // NewResponseWriter creates a new ResponseWriter
@@ -21,6 +24,8 @@ func NewResponseWriter(w http.ResponseWriter) *ResponseWriter {
 	return &ResponseWriter{
 		ResponseWriter: w,
 		status:         http.StatusOK,
+		startTime:      time.Now(),
+		customData:     make(map[string]interface{}),
 	}
 }
 
@@ -58,6 +63,37 @@ func (rw *ResponseWriter) Size() int {
 // Written returns whether the response has been written
 func (rw *ResponseWriter) Written() bool {
 	return rw.written
+}
+
+// StartTime returns the request start time
+func (rw *ResponseWriter) StartTime() time.Time {
+	return rw.startTime
+}
+
+// Latency returns the elapsed time since request start
+func (rw *ResponseWriter) Latency() time.Duration {
+	return time.Since(rw.startTime)
+}
+
+// Set adds a custom value to the ResponseWriter
+func (rw *ResponseWriter) Set(key string, value interface{}) {
+	rw.customData[key] = value
+}
+
+// Get retrieves a custom value from the ResponseWriter
+func (rw *ResponseWriter) Get(key string) (interface{}, bool) {
+	val, ok := rw.customData[key]
+	return val, ok
+}
+
+// GetString retrieves a string value with a default
+func (rw *ResponseWriter) GetString(key string, defaultVal string) string {
+	if val, ok := rw.Get(key); ok {
+		if str, ok := val.(string); ok {
+			return str
+		}
+	}
+	return defaultVal
 }
 
 // Hijack implements the http.Hijacker interface

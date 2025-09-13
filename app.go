@@ -13,14 +13,15 @@ import (
 
 // App represents the Surf application with context, logger, and shutdown handling.
 type App struct {
-	ctx      context.Context
-	logger   *slog.Logger
-	cancel   context.CancelFunc
-	shutdown chan os.Signal
-	services map[any]any
-	router   *Router
-	before   []HandlerFunc
-	after    []HandlerFunc
+	ctx         context.Context
+	logger      *slog.Logger
+	cancel      context.CancelFunc
+	shutdown    chan os.Signal
+	services    map[any]any
+	router      *Router
+	before      []HandlerFunc
+	after       []HandlerFunc
+	middlewares []Middleware
 }
 
 // NewApp initializes a new Surf application instance with context and signal handling.
