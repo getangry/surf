@@ -18,6 +18,9 @@ type App struct {
 	cancel   context.CancelFunc
 	shutdown chan os.Signal
 	services map[any]any
+	router   *Router
+	before   []HandlerFunc
+	after    []HandlerFunc
 }
 
 // NewApp initializes a new Surf application instance with context and signal handling.
@@ -26,7 +29,9 @@ type App struct {
 func NewApp(options ...Option) *App {
 
 	app := &App{
-		logger: slog.Default().WithGroup("surf"),
+		logger:   slog.Default().WithGroup("surf"),
+		router:   NewRouter(),
+		services: make(map[any]any),
 	}
 
 	// Load options
@@ -66,7 +71,7 @@ func (app *App) Serve() error {
 	// Creates HTTP server
 	server := &http.Server{
 		Addr:    ":8080",
-		Handler: http.DefaultServeMux,
+		Handler: app,
 	}
 
 	// Channel captures server startup/runtime errors
