@@ -528,10 +528,44 @@ func generateRequestID(prefix string) string {
 	return id
 }
 
-// SlogMiddleware creates a structured logging middleware using slog
-func SlogMiddleware(logger *slog.Logger) Middleware {
-	if logger == nil {
-		logger = slog.Default()
+// RequestLoggerOptions configures the RequestLogger middleware behavior
+type RequestLoggerOptions struct {
+	Logger           *slog.Logger
+	Level            slog.Level
+	IncludeReqHeaders bool
+	IncludeRespHeaders bool
+	HeaderFilter     func(key string) bool // Optional filter to include/exclude specific headers
+	GroupHeaders     bool                   // Group headers under "request_headers" and "response_headers"
+}
+
+// DefaultRequestLoggerOptions returns default options for RequestLogger
+func DefaultRequestLoggerOptions() *RequestLoggerOptions {
+	return &RequestLoggerOptions{
+		Logger:           slog.Default(),
+		Level:            slog.LevelInfo,
+		IncludeReqHeaders: false,
+		IncludeRespHeaders: false,
+		GroupHeaders:     true,
+		HeaderFilter:     nil, // Include all headers by default
+	}
+}
+
+// RequestLogger creates a structured request logging middleware using slog
+func RequestLogger(logger *slog.Logger) Middleware {
+	opts := &RequestLoggerOptions{
+		Logger: logger,
+		Level:  slog.LevelInfo,
+	}
+	return RequestLoggerWithOptions(opts)
+}
+
+// RequestLoggerWithOptions creates a configurable structured request logging middleware
+func RequestLoggerWithOptions(opts *RequestLoggerOptions) Middleware {
+	if opts == nil {
+		opts = DefaultRequestLoggerOptions()
+	}
+	if opts.Logger == nil {
+		opts.Logger = slog.Default()
 	}
 
 	return func(next http.Handler) http.Handler {
@@ -553,9 +587,54 @@ func SlogMiddleware(logger *slog.Logger) Middleware {
 				slog.String("user_agent", r.UserAgent()),
 			}
 
-			// Add custom fields from ResponseWriter
+			// Add request ID from ResponseWriter or context
 			if requestID, ok := rw.Get("request_id"); ok {
 				attrs = append(attrs, slog.Any("request_id", requestID))
+			} else if requestID := r.Context().Value(contextKey("request_id")); requestID != nil {
+				attrs = append(attrs, slog.Any("request_id", requestID))
+			}
+
+			// Add request headers if enabled
+			if opts.IncludeReqHeaders {
+				headerAttrs := make([]any, 0)
+				for key, values := range r.Header {
+					if opts.HeaderFilter == nil || opts.HeaderFilter(key) {
+						// Join multiple header values with comma
+						headerAttrs = append(headerAttrs, slog.String(key, strings.Join(values, ", ")))
+					}
+				}
+				if len(headerAttrs) > 0 {
+					if opts.GroupHeaders {
+						attrs = append(attrs, slog.Group("request_headers", headerAttrs...))
+					} else {
+						for i := 0; i < len(headerAttrs); i++ {
+							if attr, ok := headerAttrs[i].(slog.Attr); ok {
+								attrs = append(attrs, slog.Any("req_header_"+attr.Key, attr.Value))
+							}
+						}
+					}
+				}
+			}
+
+			// Add response headers if enabled
+			if opts.IncludeRespHeaders {
+				headerAttrs := make([]any, 0)
+				for key, values := range rw.Header() {
+					if opts.HeaderFilter == nil || opts.HeaderFilter(key) {
+						headerAttrs = append(headerAttrs, slog.String(key, strings.Join(values, ", ")))
+					}
+				}
+				if len(headerAttrs) > 0 {
+					if opts.GroupHeaders {
+						attrs = append(attrs, slog.Group("response_headers", headerAttrs...))
+					} else {
+						for i := 0; i < len(headerAttrs); i++ {
+							if attr, ok := headerAttrs[i].(slog.Attr); ok {
+								attrs = append(attrs, slog.Any("resp_header_"+attr.Key, attr.Value))
+							}
+						}
+					}
+				}
 			}
 
 			// Add any other custom data from ResponseWriter
@@ -566,7 +645,7 @@ func SlogMiddleware(logger *slog.Logger) Middleware {
 			}
 
 			// Log the request
-			logger.LogAttrs(context.Background(), slog.LevelInfo, "HTTP Request", attrs...)
+			opts.Logger.LogAttrs(context.Background(), opts.Level, "HTTP Request", attrs...)
 		})
 	}
 }
@@ -684,6 +763,85 @@ func CombinedMiddleware(format string, slogger *slog.Logger) Middleware {
 			}
 
 			slogger.LogAttrs(context.Background(), slog.LevelInfo, "HTTP Request", attrs...)
+		})
+	}
+}
+
+// Deprecated: Use RequestLoggerOptions instead
+type SlogOptions = RequestLoggerOptions
+
+// Deprecated: Use DefaultRequestLoggerOptions instead
+func DefaultSlogOptions() *RequestLoggerOptions {
+	return DefaultRequestLoggerOptions()
+}
+
+// Deprecated: Use RequestLogger instead
+func SlogMiddleware(logger *slog.Logger) Middleware {
+	return RequestLogger(logger)
+}
+
+// Deprecated: Use RequestLoggerWithOptions instead
+func SlogMiddlewareWithOptions(opts *RequestLoggerOptions) Middleware {
+	return RequestLoggerWithOptions(opts)
+}
+
+// Context keys for logger
+type loggerKey struct{}
+
+// WithRequestLogger adds a logger to the request context
+func WithRequestLogger(r *http.Request, logger *slog.Logger) *http.Request {
+	ctx := context.WithValue(r.Context(), loggerKey{}, logger)
+	return r.WithContext(ctx)
+}
+
+// GetRequestLogger retrieves a logger from the request context
+// If no logger is found, returns the default slog logger
+func GetRequestLogger(r *http.Request) *slog.Logger {
+	if logger, ok := r.Context().Value(loggerKey{}).(*slog.Logger); ok {
+		return logger
+	}
+	return slog.Default()
+}
+
+// LoggerFromRequest creates a logger with request context (including request_id)
+// This allows application logic to log with the same request_id as the HTTP logs
+func LoggerFromRequest(r *http.Request, baseLogger *slog.Logger) *slog.Logger {
+	if baseLogger == nil {
+		baseLogger = slog.Default()
+	}
+
+	// Start with base logger
+	logger := baseLogger
+
+	// Add request ID if available
+	if requestID := GetRequestID(r); requestID != "" {
+		logger = logger.With("request_id", requestID)
+	}
+
+	// Add any other context values you might want
+	if userID := GetUserID(r); userID != "" {
+		logger = logger.With("user_id", userID)
+	}
+
+	return logger
+}
+
+// RequestLoggerInjector creates middleware that injects a context-aware logger into each request
+// This logger will automatically include request_id and other context values
+func RequestLoggerInjector(baseLogger *slog.Logger) Middleware {
+	if baseLogger == nil {
+		baseLogger = slog.Default()
+	}
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Create a logger with request context
+			logger := LoggerFromRequest(r, baseLogger)
+
+			// Add logger to request context
+			r = WithRequestLogger(r, logger)
+
+			next.ServeHTTP(w, r)
 		})
 	}
 }

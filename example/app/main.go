@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/json"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"github.com/getangry/surf"
 	"github.com/getangry/surf/pkg/logger/reef"
@@ -46,8 +48,32 @@ func main() {
 	surfApp := surf.NewApp(surf.WithLogger(logger.With(reef.Color, "white").With(reef.Backtrace())))
 	defer surfApp.Cleanup()
 
-	surfApp.Get("/", func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("Hello, Surf!"))
+	surfApp.Use(surf.RequestIDMiddleware("demo"))
+
+	slogger := logger.With("component", "http")
+	slogOpts := &surf.SlogOptions{
+		Logger:             slogger,
+		Level:              slog.LevelInfo,
+		IncludeReqHeaders:  true,
+		IncludeRespHeaders: true,
+		GroupHeaders:       true,
+		HeaderFilter: func(key string) bool {
+			// Exclude sensitive headers
+			lower := strings.ToLower(key)
+			return !strings.Contains(lower, "authorization") &&
+				!strings.Contains(lower, "cookie")
+		},
+	}
+	surfApp.Use(surf.SlogMiddlewareWithOptions(slogOpts))
+
+	surfApp.Get("/", func(w http.ResponseWriter, r *http.Request) error {
+		response := map[string]any{
+			"message": "Hello, Surf with slog!",
+			"status":  "success",
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		return json.NewEncoder(w).Encode(response)
 	})
 
 	if err := surfApp.Serve(); err != nil {

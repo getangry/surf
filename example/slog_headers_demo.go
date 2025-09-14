@@ -23,38 +23,39 @@ func main() {
 
 	slogger := slog.New(reef.NewHandler())
 
-	// Option 1: Use RequestLogger middleware with options
-	app.Use(surf.RequestIDMiddleware("demo"))
+	// Configure RequestLogger with options
 	loggerOpts := &surf.RequestLoggerOptions{
 		Logger:             slogger,
 		Level:              slog.LevelInfo,
-		IncludeReqHeaders:  true,
-		IncludeRespHeaders: true,
-		GroupHeaders:       true,
+		IncludeReqHeaders:  true,  // Include request headers
+		IncludeRespHeaders: true,  // Include response headers
+		GroupHeaders:       true,  // Group headers under request_headers and response_headers
 		HeaderFilter: func(key string) bool {
-			// Exclude sensitive headers
+			// Filter out sensitive headers
 			lower := strings.ToLower(key)
 			return !strings.Contains(lower, "authorization") &&
-				!strings.Contains(lower, "cookie")
+				   !strings.Contains(lower, "cookie") &&
+				   !strings.Contains(lower, "x-api-key")
 		},
 	}
+
+	// Apply middlewares
+	app.Use(surf.RequestIDMiddleware("demo"))
 	app.Use(surf.RequestLoggerWithOptions(loggerOpts))
 
-	// Option 2: Use reef-compatible middleware (commented out)
-	// app.Use(surf.ReefCompatibleMiddleware(slogger))
-
-	// Option 3: Use both traditional log and slog (commented out)
-	// app.Use(surf.CombinedMiddleware("{method} {path} {status} {latency_ms}ms", slogger))
-
-	// Example route
+	// Example routes
 	app.Get("/", func(w http.ResponseWriter, r *http.Request) error {
+		// Add custom response headers
+		w.Header().Set("X-Custom-Header", "custom-value")
+		w.Header().Set("X-Service-Version", "1.0.0")
+
 		if rw, ok := w.(*surf.ResponseWriter); ok {
 			rw.Set("operation", "home")
 			rw.Set("user_id", "user-123")
 		}
 
 		response := map[string]any{
-			"message": "Hello, World!",
+			"message": "Hello with headers!",
 			"time":    time.Now().Format(time.RFC3339),
 		}
 
@@ -65,6 +66,10 @@ func main() {
 	app.Get("/api/test/:id", func(w http.ResponseWriter, r *http.Request) error {
 		id := surf.Param(r, "id")
 
+		// Add custom headers
+		w.Header().Set("X-Resource-ID", id)
+		w.Header().Set("Cache-Control", "no-cache")
+
 		if rw, ok := w.(*surf.ResponseWriter); ok {
 			rw.Set("operation", "get_test")
 			rw.Set("test_id", id)
@@ -73,7 +78,7 @@ func main() {
 
 		response := map[string]any{
 			"id":      id,
-			"message": "Test successful",
+			"message": "Test with headers",
 			"data":    []string{"item1", "item2"},
 		}
 
@@ -81,10 +86,20 @@ func main() {
 		return json.NewEncoder(w).Encode(response)
 	})
 
-	slogger.Info("Server starting", "port", 8081)
+	// Example with minimal headers logging
+	app.Get("/minimal", func(w http.ResponseWriter, r *http.Request) error {
+		response := map[string]any{
+			"message": "Minimal response",
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		return json.NewEncoder(w).Encode(response)
+	})
+
+	slogger.Info("Server starting with header logging", "port", 8082)
 
 	server := &http.Server{
-		Addr:    ":8081",
+		Addr:    ":8082",
 		Handler: app,
 	}
 
@@ -99,7 +114,7 @@ func main() {
 		}
 	}()
 
-	slogger.Info("Server started, press Ctrl+C to exit")
+	slogger.Info("Server started with header logging enabled, press Ctrl+C to exit")
 
 	<-quit
 	slogger.Info("Shutting down server...")
