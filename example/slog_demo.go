@@ -18,10 +18,8 @@ import (
 )
 
 func main() {
-	// Create a new Surf app
 	app := surf.NewApp()
 
-	// Create a structured slog logger (JSON format for reef compatibility)
 	slogger := slog.New(reef.NewHandler())
 
 	// Option 1: Use only slog middleware
@@ -36,7 +34,6 @@ func main() {
 
 	// Example route
 	app.Get("/", func(w http.ResponseWriter, r *http.Request) error {
-		// Add custom data to ResponseWriter for structured logging
 		if rw, ok := w.(*surf.ResponseWriter); ok {
 			rw.Set("operation", "home")
 			rw.Set("user_id", "user-123")
@@ -54,7 +51,6 @@ func main() {
 	app.Get("/api/test/:id", func(w http.ResponseWriter, r *http.Request) error {
 		id := surf.Param(r, "id")
 
-		// Add custom data to ResponseWriter for structured logging
 		if rw, ok := w.(*surf.ResponseWriter); ok {
 			rw.Set("operation", "get_test")
 			rw.Set("test_id", id)
@@ -73,7 +69,6 @@ func main() {
 
 	slogger.Info("Server starting", "port", 8081)
 
-	// Create server with custom port
 	server := &http.Server{
 		Addr:    ":8081",
 		Handler: app,
@@ -83,7 +78,6 @@ func main() {
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
-	// Start server in a goroutine
 	go func() {
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slogger.Error("Server failed", "error", err)
@@ -93,11 +87,9 @@ func main() {
 
 	slogger.Info("Server started, press Ctrl+C to exit")
 
-	// Wait for interrupt signal
 	<-quit
 	slogger.Info("Shutting down server...")
 
-	// Create context with timeout for graceful shutdown
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 

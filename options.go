@@ -12,7 +12,6 @@ type Option func(*App)
 // WithLogger sets a custom logger for the Surf application.
 func WithLogger(logger *slog.Logger) Option {
 	return func(app *App) {
-		// Set default logger with white color for context
 		app.logger = logger
 	}
 }

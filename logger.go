@@ -113,6 +113,18 @@ func GetUserID(r *http.Request) string {
 	return GetString(r, "user_id", "")
 }
 
+// GetService retrieves a service from the application's service container
+// It requires access to the application instance through the request context
+func GetService[T any](r *http.Request, key any) T {
+	if app, ok := r.Context().Value(appKey{}).(*App); ok {
+		if service := app.GetService(key); service != nil {
+			return service.(T)
+		}
+	}
+	var zero T
+	return zero
+}
+
 // WithRequest provides a fluent interface for setting multiple context values
 type WithRequest struct {
 	r **http.Request
@@ -279,7 +291,6 @@ func formatLog(template string, entry *LogEntry) string {
 	return re.ReplaceAllStringFunc(template, func(match string) string {
 		token := strings.Trim(match, "{}")
 
-		// Check if it's a custom field with $ prefix
 		if strings.HasPrefix(token, "$") {
 			key := strings.TrimPrefix(token, "$")
 			return entry.CustomVal(key)

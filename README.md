@@ -167,6 +167,33 @@ app.Get("/users/:id", func(w http.ResponseWriter, r *http.Request) error {
 })
 ```
 
+## Service Container
+
+Register and inject dependencies using the built-in service container:
+
+```go
+// Register services at startup
+app.Set("db", dbConnection)
+app.Set("redis", redisClient)
+app.Set("userService", &UserService{DB: dbConnection})
+
+// Use in handlers with type safety
+app.Get("/users/:id", func(w http.ResponseWriter, r *http.Request) error {
+    db := surf.GetService[*sql.DB](r, "db")
+    userService := surf.GetService[*UserService](r, "userService")
+
+    // Use services...
+    return nil
+})
+
+// Use in middleware
+app.UseFunc(func(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) {
+    config := surf.GetService[*ConfigService](r, "config")
+    // Use config...
+    next(w, r)
+})
+```
+
 ## Request Context Storage
 
 Store and retrieve data in request context:
@@ -199,6 +226,14 @@ See `example/slog_demo.go` for structured logging with:
 - Reef package compatibility
 - JSON output format
 - Graceful shutdown
+
+### Service Container
+
+See `example/services_demo.go` for dependency injection with:
+- Service registration and retrieval
+- Type-safe service access with generics
+- Database and service layer examples
+- Middleware service usage
 
 ## Middleware Options
 

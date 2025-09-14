@@ -11,13 +11,10 @@ import (
 )
 
 func main() {
-	// Create a new Surf app
 	app := surf.NewApp()
 
-	// Add request ID middleware using new standard pattern
 	app.Use(surf.RequestIDMiddleware("api"))
 
-	// Add logging middleware using new standard pattern
 	app.Use(surf.LoggingMiddleware("{method} {path} {status} {latency_ms}ms id:{$request_id} user:{$user_id}"))
 
 	// Example: Auth middleware that sets user context
@@ -60,7 +57,6 @@ func main() {
 
 	// API routes
 	api.Get("/users", func(w http.ResponseWriter, r *http.Request) error {
-		// Add custom logging context using ResponseWriter
 		if rw, ok := w.(*surf.ResponseWriter); ok {
 			rw.Set("operation", "list_users")
 			rw.Set("items_count", 2)
@@ -76,7 +72,6 @@ func main() {
 	api.Get("/users/:id", func(w http.ResponseWriter, r *http.Request) error {
 		id := surf.Param(r, "id")
 
-		// Add context for this specific request
 		surf.Store(r, "operation", "get_user")
 		surf.Store(r, "target_user", id)
 		surf.Store(r, "cache_hit", false)
@@ -134,7 +129,6 @@ func main() {
 			return fmt.Errorf("unauthorized access")
 		}
 
-		// Set admin context for logging
 		surf.Store(r, "user_type", "admin")
 		surf.Store(r, "auth_method", "bearer_token")
 		surf.Store(r, "permission_level", "high")
@@ -177,7 +171,6 @@ func main() {
 		"{method} {path} {status} {latency_ms}ms size={size}b"
 	*/
 
-	// Start the server
 	log.Println("Server starting on :8080")
 	if err := app.Serve(); err != nil {
 		log.Fatal(err)

@@ -35,7 +35,6 @@ func NewApp(options ...Option) *App {
 		services: make(map[any]any),
 	}
 
-	// Load options
 	for _, opt := range options {
 		opt(app)
 	}
@@ -121,6 +120,16 @@ func (app *App) Serve() error {
 
 	log.Println("Shutdown completed successfully")
 	return nil
+}
+
+// Set registers a service in the application's service container
+func (app *App) Set(key any, service any) {
+	app.services[key] = service
+}
+
+// GetService retrieves a service from the application's service container
+func (app *App) GetService(key any) any {
+	return app.services[key]
 }
 
 // Cleanup stops signal notification and cancels context

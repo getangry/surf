@@ -206,9 +206,11 @@ func (g *Group) addRoute(method, pattern string, handler HandlerFunc) {
 
 // ServeHTTP implements the http.Handler interface
 func (app *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	ctx := context.WithValue(r.Context(), appKey{}, app)
+	r = r.WithContext(ctx)
+
 	// If we have standard middlewares, chain them
 	if len(app.middlewares) > 0 {
-		// Create the final handler
 		final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			app.serveLegacy(w, r)
 		})
@@ -229,14 +231,11 @@ func (app *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // serveLegacy handles the original Before/After middleware pattern
 func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
-	// Wrap the response writer
 	rw := NewResponseWriter(w)
 
-	// Store the ResponseWriter in context
 	ctx := context.WithValue(r.Context(), responseKey{}, rw)
 	r = r.WithContext(ctx)
 
-	// Run global before handlers
 	for _, handler := range app.before {
 		if err := handler(rw, r); err != nil {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
@@ -244,18 +243,15 @@ func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Find and execute the matching route
 	if routes, ok := app.router.routes[r.Method]; ok {
 		for pattern, route := range routes {
 			if params, ok := matchPath(pattern, r.URL.Path); ok {
-				// Add path parameters to context
 				ctx := r.Context()
 				for key, value := range params {
 					ctx = context.WithValue(ctx, contextKey(key), value)
 				}
 				r = r.WithContext(ctx)
 
-				// Run group-specific before handlers
 				for _, handler := range route.before {
 					if err := handler(rw, r); err != nil {
 						http.Error(rw, err.Error(), http.StatusInternalServerError)
@@ -263,13 +259,11 @@ func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 
-				// Execute the handler
 				if err := route.handler(rw, r); err != nil {
 					http.Error(rw, err.Error(), http.StatusInternalServerError)
 					return
 				}
 
-				// Run group-specific after handlers
 				for _, handler := range route.after {
 					if err := handler(rw, r); err != nil {
 						http.Error(rw, err.Error(), http.StatusInternalServerError)
@@ -277,7 +271,6 @@ func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 
-				// Run global after handlers
 				for _, handler := range app.after {
 					if err := handler(rw, r); err != nil {
 						http.Error(rw, err.Error(), http.StatusInternalServerError)
@@ -318,7 +311,6 @@ func matchPath(pattern, path string) (map[string]string, bool) {
 	patternParts := strings.Split(pattern, "/")
 	pathParts := strings.Split(path, "/")
 
-	// Handle wildcard routes
 	if strings.Contains(pattern, "*") {
 		wildcardIndex := -1
 		for i, part := range patternParts {
@@ -329,7 +321,6 @@ func matchPath(pattern, path string) (map[string]string, bool) {
 		}
 
 		if wildcardIndex != -1 {
-			// Check if the parts before wildcard match
 			if wildcardIndex > len(pathParts) {
 				return nil, false
 			}
