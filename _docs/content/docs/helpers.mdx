@@ -1,0 +1,190 @@
+---
+title: Helpers
+description: Query parameter helpers and redirect utilities
+---
+
+# Helpers
+
+Surf provides convenient helper functions for common HTTP operations like parsing query parameters and handling redirects.
+
+## Query Parameters
+
+Type-safe query parameter parsing with sensible defaults.
+
+### String Parameters
+
+```go
+// Get raw query parameter (empty string if missing)
+name := surf.Query(r, "name")
+
+// Get with default value
+name := surf.QueryDefault(r, "name", "anonymous")
+```
+
+### Numeric Parameters
+
+```go
+// Integer with default
+page := surf.QueryInt(r, "page", 1)
+limit := surf.QueryInt(r, "limit", 20)
+
+// Int64 for large numbers
+offset := surf.QueryInt64(r, "offset", 0)
+
+// Float64 for decimals
+price := surf.QueryFloat(r, "price", 0.0)
+```
+
+<Callout type="info">
+  If the value cannot be parsed, the default is returned. No errors are raised.
+</Callout>
+
+### Boolean Parameters
+
+```go
+// Accepts: "true", "1", "yes", "on" (case-insensitive)
+active := surf.QueryBool(r, "active", true)
+verbose := surf.QueryBool(r, "verbose", false)
+```
+
+| Value | Result |
+|-------|--------|
+| `true`, `TRUE`, `True` | `true` |
+| `1` | `true` |
+| `yes`, `YES` | `true` |
+| `on`, `ON` | `true` |
+| `false`, `0`, `no`, `off` | `false` |
+| (missing) | default value |
+| (invalid) | `false` |
+
+### Slice Parameters
+
+For multi-value parameters like `?tags=a&tags=b&tags=c`:
+
+```go
+tags := surf.QuerySlice(r, "tags")
+// tags = []string{"a", "b", "c"}
+
+// Returns nil if parameter is missing
+categories := surf.QuerySlice(r, "categories")
+if categories == nil {
+    // Parameter not provided
+}
+```
+
+## Complete Example
+
+```go
+app.Get("/search", func(w http.ResponseWriter, r *http.Request) error {
+    // Search parameters
+    query := surf.Query(r, "q")
+    category := surf.QueryDefault(r, "category", "all")
+
+    // Pagination
+    page := surf.QueryInt(r, "page", 1)
+    limit := surf.QueryInt(r, "limit", 20)
+
+    // Filters
+    minPrice := surf.QueryFloat(r, "min_price", 0)
+    maxPrice := surf.QueryFloat(r, "max_price", 1000000)
+    inStock := surf.QueryBool(r, "in_stock", false)
+
+    // Multi-value filters
+    tags := surf.QuerySlice(r, "tags")
+    brands := surf.QuerySlice(r, "brands")
+
+    // Use parameters...
+    results := searchProducts(SearchParams{
+        Query:    query,
+        Category: category,
+        Page:     page,
+        Limit:    limit,
+        MinPrice: minPrice,
+        MaxPrice: maxPrice,
+        InStock:  inStock,
+        Tags:     tags,
+        Brands:   brands,
+    })
+
+    return json.NewEncoder(w).Encode(results)
+})
+```
+
+## Redirects
+
+Helper functions for HTTP redirects:
+
+### Generic Redirect
+
+```go
+// Redirect with any status code
+surf.Redirect(w, r, "/new-location", http.StatusFound)
+```
+
+### Convenience Functions
+
+```go
+// 301 Moved Permanently - for permanent URL changes
+surf.RedirectPermanent(w, r, "/new-url")
+
+// 302 Found - for temporary redirects
+surf.RedirectTemporary(w, r, "/temp-location")
+
+// 303 See Other - use after POST to prevent resubmission
+surf.RedirectSeeOther(w, r, "/success")
+```
+
+### When to Use Each
+
+| Function | Status | Use Case |
+|----------|--------|----------|
+| `RedirectPermanent` | 301 | URL has permanently changed, SEO redirect |
+| `RedirectTemporary` | 302 | Temporary redirect, maintenance page |
+| `RedirectSeeOther` | 303 | After POST/PUT to show result page |
+
+### Example: Post/Redirect/Get Pattern
+
+```go
+app.Post("/orders", func(w http.ResponseWriter, r *http.Request) error {
+    // Process order...
+    order, err := createOrder(r)
+    if err != nil {
+        return err
+    }
+
+    // Redirect to order confirmation (prevents duplicate submissions)
+    surf.RedirectSeeOther(w, r, "/orders/"+order.ID+"/confirmation")
+    return nil
+})
+
+app.Get("/orders/:id/confirmation", func(w http.ResponseWriter, r *http.Request) error {
+    id := surf.Param(r, "id")
+    // Show confirmation page...
+    return nil
+})
+```
+
+## Path Parameters
+
+Extract dynamic path segments:
+
+```go
+app.Get("/users/:id/posts/:postId", func(w http.ResponseWriter, r *http.Request) error {
+    userID := surf.Param(r, "id")
+    postID := surf.Param(r, "postId")
+
+    // Returns empty string if parameter doesn't exist
+    return nil
+})
+```
+
+## Next Steps
+
+<Cards>
+  <Card title="Static Files" href="/docs/static-files">
+    Serve static files and directories
+  </Card>
+  <Card title="Error Handling" href="/docs/error-handling">
+    Custom error handlers
+  </Card>
+</Cards>

@@ -1,0 +1,18 @@
+{
+  "title": "Documentation",
+  "pages": [
+    "index",
+    "---Getting Started---",
+    "installation",
+    "quickstart",
+    "---Core Concepts---",
+    "routing",
+    "middleware",
+    "helpers",
+    "---Features---",
+    "static-files",
+    "error-handling",
+    "---Reference---",
+    "api-reference"
+  ]
+}

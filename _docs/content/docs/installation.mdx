@@ -1,0 +1,80 @@
+---
+title: Installation
+description: How to install Surf in your Go project
+---
+
+# Installation
+
+## Requirements
+
+- Go 1.21 or higher
+- A working Go development environment
+
+## Install with Go
+
+Add Surf to your project using `go get`:
+
+```bash
+go get github.com/getangry/surf
+```
+
+## Verify Installation
+
+Create a simple test file to verify Surf is installed correctly:
+
+```go title="main.go"
+package main
+
+import (
+    "net/http"
+    "github.com/getangry/surf"
+)
+
+func main() {
+    app := surf.NewApp()
+
+    app.Get("/", func(w http.ResponseWriter, r *http.Request) error {
+        w.Write([]byte("Surf is working!"))
+        return nil
+    })
+
+    app.Serve()
+}
+```
+
+Run your application:
+
+```bash
+go run main.go
+```
+
+Visit `http://localhost:8080` in your browser. You should see "Surf is working!".
+
+## Project Structure
+
+A typical Surf project might look like this:
+
+```
+myapp/
+├── main.go           # Application entry point
+├── handlers/         # HTTP handlers
+│   ├── users.go
+│   └── products.go
+├── middleware/       # Custom middleware
+│   └── auth.go
+├── services/         # Business logic
+│   └── user_service.go
+├── go.mod
+└── go.sum
+```
+
+## Next Steps
+
+<Cards>
+  <Card title="Quick Start" href="/docs/quickstart">
+    Build your first complete Surf application
+  </Card>
+  <Card title="Routing" href="/docs/routing">
+    Learn about Surf's routing system
+  </Card>
+</Cards>

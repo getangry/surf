@@ -1,0 +1,77 @@
+---
+title: Introduction
+description: A lightweight, high-performance HTTP web framework for Go
+---
+
+# Welcome to Surf
+
+Surf is a lightweight, high-performance HTTP web framework for Go. It provides a clean API for building web applications with features like radix tree routing, built-in middleware, and structured logging.
+
+## Features
+
+<Cards>
+  <Card title="Fast Routing" icon="zap">
+    Radix tree-based router with O(log n) route matching - 73x faster than linear search.
+  </Card>
+  <Card title="Built-in Middleware" icon="layers">
+    CORS, Recovery, Rate Limiting, Timeout, and Gzip compression out of the box.
+  </Card>
+  <Card title="Static Files" icon="folder">
+    Serve directories and individual static files with directory traversal protection.
+  </Card>
+  <Card title="Structured Logging" icon="file-text">
+    Built-in slog integration with template-based and structured logging options.
+  </Card>
+</Cards>
+
+## Quick Example
+
+```go title="main.go"
+package main
+
+import (
+    "encoding/json"
+    "net/http"
+    "github.com/getangry/surf"
+)
+
+func main() {
+    app := surf.NewApp()
+
+    // Add middleware
+    app.Use(surf.RecoveryWithDefaults())
+    app.Use(surf.CORSWithDefaults())
+
+    // Define routes
+    app.Get("/hello/:name", func(w http.ResponseWriter, r *http.Request) error {
+        name := surf.Param(r, "name")
+        return json.NewEncoder(w).Encode(map[string]string{
+            "message": "Hello, " + name + "!",
+        })
+    })
+
+    // Start server
+    app.Serve()
+}
+```
+
+## Why Surf?
+
+- **Simple**: Clean, intuitive API that feels natural to Go developers
+- **Fast**: Radix tree routing provides excellent performance at scale
+- **Safe**: Thread-safe design with proper mutex handling
+- **Complete**: Everything you need for production web apps included
+
+## Next Steps
+
+<Cards>
+  <Card title="Installation" href="/docs/installation">
+    Get Surf installed in your Go project
+  </Card>
+  <Card title="Quick Start" href="/docs/quickstart">
+    Build your first Surf application
+  </Card>
+  <Card title="Routing" href="/docs/routing">
+    Learn about path parameters and route groups
+  </Card>
+</Cards>

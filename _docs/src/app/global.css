@@ -1,0 +1,43 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  /* Mintlify-inspired styling */
+  --fd-primary: 142 71% 45%;
+  --fd-background: 0 0% 100%;
+  --fd-foreground: 240 10% 4%;
+  --fd-muted: 240 5% 96%;
+  --fd-muted-foreground: 240 4% 46%;
+  --fd-border: 240 6% 90%;
+  --fd-ring: 142 71% 45%;
+}
+
+.dark {
+  --fd-primary: 142 71% 45%;
+  --fd-background: 240 10% 4%;
+  --fd-foreground: 0 0% 98%;
+  --fd-muted: 240 4% 16%;
+  --fd-muted-foreground: 240 5% 65%;
+  --fd-border: 240 4% 16%;
+}
+
+/* Mintlify-style card hover effects */
+.fd-card {
+  transition: all 0.2s ease;
+}
+
+.fd-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+}
+
+/* Clean code blocks like Mintlify */
+pre {
+  border-radius: 8px !important;
+}
+
+/* Smooth scrolling */
+html {
+  scroll-behavior: smooth;
+}

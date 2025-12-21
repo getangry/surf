@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -17,6 +18,7 @@ type ResponseWriter struct {
 	wroteHeader bool
 	startTime   time.Time
 	customData  map[string]interface{}
+	mu          sync.RWMutex
 }
 
 // NewResponseWriter creates a new ResponseWriter
@@ -75,18 +77,22 @@ func (rw *ResponseWriter) Latency() time.Duration {
 	return time.Since(rw.startTime)
 }
 
-// Set adds a custom value to the ResponseWriter
+// Set adds a custom value to the ResponseWriter (thread-safe)
 func (rw *ResponseWriter) Set(key string, value interface{}) {
+	rw.mu.Lock()
 	rw.customData[key] = value
+	rw.mu.Unlock()
 }
 
-// Get retrieves a custom value from the ResponseWriter
+// Get retrieves a custom value from the ResponseWriter (thread-safe)
 func (rw *ResponseWriter) Get(key string) (interface{}, bool) {
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
 	val, ok := rw.customData[key]
 	return val, ok
 }
 
-// GetString retrieves a string value with a default
+// GetString retrieves a string value with a default (thread-safe)
 func (rw *ResponseWriter) GetString(key string, defaultVal string) string {
 	if val, ok := rw.Get(key); ok {
 		if str, ok := val.(string); ok {
@@ -94,6 +100,17 @@ func (rw *ResponseWriter) GetString(key string, defaultVal string) string {
 		}
 	}
 	return defaultVal
+}
+
+// CustomData returns a copy of the custom data map (thread-safe)
+func (rw *ResponseWriter) CustomData() map[string]interface{} {
+	rw.mu.RLock()
+	defer rw.mu.RUnlock()
+	copy := make(map[string]interface{}, len(rw.customData))
+	for k, v := range rw.customData {
+		copy[k] = v
+	}
+	return copy
 }
 
 // Hijack implements the http.Hijacker interface
@@ -119,12 +136,19 @@ func (rw *ResponseWriter) Push(target string, opts *http.PushOptions) error {
 	return errors.New("response writer does not support push")
 }
 
-// CloseNotify implements the http.CloseNotifier interface (deprecated)
+// CloseNotify implements the http.CloseNotifier interface.
+// Deprecated: Use http.ResponseController or context.Done() instead.
+// This method is kept for backwards compatibility but may return nil
+// if the underlying ResponseWriter doesn't support it.
 func (rw *ResponseWriter) CloseNotify() <-chan bool {
+	//nolint:staticcheck // Keeping for backwards compatibility
 	if notifier, ok := rw.ResponseWriter.(http.CloseNotifier); ok {
 		return notifier.CloseNotify()
 	}
-	return nil
+	// Return a closed channel instead of nil to prevent nil channel receive bugs
+	ch := make(chan bool)
+	close(ch)
+	return ch
 }
 
 // ResponseController returns the response controller for this response

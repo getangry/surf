@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"os"
+	"time"
 )
 
 // Option defines a function type for configuring the App.
@@ -34,5 +35,47 @@ func WithShutdownChannel(shutdown chan os.Signal) Option {
 func WithCancelFunc(cancel context.CancelFunc) Option {
 	return func(app *App) {
 		app.cancel = cancel
+	}
+}
+
+// WithAddr sets the server listen address (e.g., ":8080", "0.0.0.0:3000").
+func WithAddr(addr string) Option {
+	return func(app *App) {
+		app.serverConfig.Addr = addr
+	}
+}
+
+// WithServerConfig sets the complete server configuration.
+func WithServerConfig(config ServerConfig) Option {
+	return func(app *App) {
+		app.serverConfig = config
+	}
+}
+
+// WithReadTimeout sets the maximum duration for reading the entire request.
+func WithReadTimeout(d time.Duration) Option {
+	return func(app *App) {
+		app.serverConfig.ReadTimeout = d
+	}
+}
+
+// WithWriteTimeout sets the maximum duration before timing out writes of the response.
+func WithWriteTimeout(d time.Duration) Option {
+	return func(app *App) {
+		app.serverConfig.WriteTimeout = d
+	}
+}
+
+// WithIdleTimeout sets the maximum amount of time to wait for the next request.
+func WithIdleTimeout(d time.Duration) Option {
+	return func(app *App) {
+		app.serverConfig.IdleTimeout = d
+	}
+}
+
+// WithMaxHeaderBytes sets the maximum size of request headers.
+func WithMaxHeaderBytes(n int) Option {
+	return func(app *App) {
+		app.serverConfig.MaxHeaderBytes = n
 	}
 }

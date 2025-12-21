@@ -1,0 +1,236 @@
+---
+title: Error Handling
+description: Custom error handlers for 404 and 405 responses
+---
+
+# Error Handling
+
+Surf provides customizable error handling for common HTTP error scenarios.
+
+## Custom 404 Handler
+
+Handle requests to non-existent routes:
+
+```go
+app := surf.NewApp()
+
+app.NotFound(func(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusNotFound)
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "error":   "Not Found",
+        "message": "The requested resource does not exist",
+        "path":    r.URL.Path,
+    })
+})
+```
+
+### HTML 404 Page
+
+```go
+app.NotFound(func(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "text/html")
+    w.WriteHeader(http.StatusNotFound)
+    http.ServeFile(w, r, "./templates/404.html")
+})
+```
+
+### API vs Web 404
+
+```go
+app.NotFound(func(w http.ResponseWriter, r *http.Request) {
+    // JSON for API routes
+    if strings.HasPrefix(r.URL.Path, "/api/") {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusNotFound)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error": "Resource not found",
+        })
+        return
+    }
+
+    // HTML for web routes
+    w.Header().Set("Content-Type", "text/html")
+    w.WriteHeader(http.StatusNotFound)
+    http.ServeFile(w, r, "./templates/404.html")
+})
+```
+
+## Custom 405 Handler
+
+Handle requests with invalid HTTP methods:
+
+```go
+app.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(http.StatusMethodNotAllowed)
+    json.NewEncoder(w).Encode(map[string]interface{}{
+        "error":   "Method Not Allowed",
+        "message": fmt.Sprintf("%s is not allowed for this resource", r.Method),
+        "allowed": w.Header().Get("Allow"), // Surf sets this automatically
+    })
+})
+```
+
+<Callout type="info">
+  Surf automatically sets the `Allow` header with valid methods when returning 405.
+</Callout>
+
+### Example Scenario
+
+```go
+app.Get("/users", listUsers)   // Only GET is allowed
+app.Post("/users", createUser) // POST is also allowed
+
+// Request: DELETE /users
+// Response: 405 Method Not Allowed
+// Headers: Allow: GET, POST
+```
+
+## Handler Errors
+
+When a handler returns an error, Surf logs it and returns 500:
+
+```go
+app.Get("/data", func(w http.ResponseWriter, r *http.Request) error {
+    data, err := fetchFromDatabase()
+    if err != nil {
+        // Logged internally, returns 500 to client
+        return err
+    }
+    return json.NewEncoder(w).Encode(data)
+})
+```
+
+### Custom Error Responses
+
+For custom error handling, handle errors in the handler:
+
+```go
+app.Get("/users/:id", func(w http.ResponseWriter, r *http.Request) error {
+    id := surf.Param(r, "id")
+
+    user, err := getUserByID(id)
+    if err != nil {
+        if errors.Is(err, ErrNotFound) {
+            w.WriteHeader(http.StatusNotFound)
+            return json.NewEncoder(w).Encode(map[string]string{
+                "error": "User not found",
+            })
+        }
+        // Let Surf handle unexpected errors
+        return err
+    }
+
+    return json.NewEncoder(w).Encode(user)
+})
+```
+
+## Recovery Middleware
+
+Use the Recovery middleware to handle panics gracefully:
+
+```go
+app.Use(surf.Recovery(surf.RecoveryConfig{
+    RecoveryHandler: func(w http.ResponseWriter, r *http.Request, err interface{}) {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusInternalServerError)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error": "Internal server error",
+        })
+    },
+}))
+```
+
+## Error Response Structure
+
+A consistent error response structure is recommended:
+
+```go
+type ErrorResponse struct {
+    Error   string      `json:"error"`
+    Message string      `json:"message,omitempty"`
+    Code    string      `json:"code,omitempty"`
+    Details interface{} `json:"details,omitempty"`
+}
+
+func respondError(w http.ResponseWriter, status int, err ErrorResponse) {
+    w.Header().Set("Content-Type", "application/json")
+    w.WriteHeader(status)
+    json.NewEncoder(w).Encode(err)
+}
+
+// Usage
+app.Get("/users/:id", func(w http.ResponseWriter, r *http.Request) error {
+    user, err := getUser(surf.Param(r, "id"))
+    if err != nil {
+        respondError(w, http.StatusNotFound, ErrorResponse{
+            Error:   "Not Found",
+            Message: "User does not exist",
+            Code:    "USER_NOT_FOUND",
+        })
+        return nil
+    }
+    return json.NewEncoder(w).Encode(user)
+})
+```
+
+## Complete Example
+
+```go
+package main
+
+import (
+    "encoding/json"
+    "net/http"
+    "strings"
+
+    "github.com/getangry/surf"
+)
+
+func main() {
+    app := surf.NewApp()
+
+    // Recovery middleware
+    app.Use(surf.RecoveryWithDefaults())
+
+    // Custom 404
+    app.NotFound(func(w http.ResponseWriter, r *http.Request) {
+        if strings.HasPrefix(r.URL.Path, "/api/") {
+            w.Header().Set("Content-Type", "application/json")
+            w.WriteHeader(http.StatusNotFound)
+            json.NewEncoder(w).Encode(map[string]string{
+                "error": "Endpoint not found",
+            })
+            return
+        }
+        http.ServeFile(w, r, "./public/404.html")
+    })
+
+    // Custom 405
+    app.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusMethodNotAllowed)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error":   "Method not allowed",
+            "allowed": w.Header().Get("Allow"),
+        })
+    })
+
+    // Routes
+    app.Get("/api/health", healthCheck)
+
+    app.Serve()
+}
+```
+
+## Next Steps
+
+<Cards>
+  <Card title="API Reference" href="/docs/api-reference">
+    Complete API documentation
+  </Card>
+  <Card title="Middleware" href="/docs/middleware">
+    Built-in middleware options
+  </Card>
+</Cards>

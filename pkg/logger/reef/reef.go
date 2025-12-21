@@ -104,6 +104,26 @@ func WithHandlerType(hType HandlerType) Option {
 	}
 }
 
+// fileWriterCloser wraps a file with MultiWriter for proper cleanup
+type fileWriterCloser struct {
+	file   *os.File
+	writer io.Writer
+}
+
+func (f *fileWriterCloser) Write(p []byte) (n int, err error) {
+	return f.writer.Write(p)
+}
+
+func (f *fileWriterCloser) Close() error {
+	if f.file != nil {
+		return f.file.Close()
+	}
+	return nil
+}
+
+// WithForkedOutfile writes logs to both the current writer and a file.
+// The returned file handle should be closed when the logger is no longer needed.
+// Consider using WithForkedOutfileCloser for explicit cleanup control.
 func WithForkedOutfile(path string) Option {
 	return func(o *Options) {
 		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
@@ -112,6 +132,24 @@ func WithForkedOutfile(path string) Option {
 		}
 		o.writer = io.MultiWriter(o.writer, f)
 	}
+}
+
+// WithForkedOutfileCloser writes logs to both the current writer and a file,
+// returning an io.Closer that should be called to properly close the file.
+func WithForkedOutfileCloser(path string) (Option, io.Closer, error) {
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to open log file %s: %w", path, err)
+	}
+
+	fc := &fileWriterCloser{file: f}
+
+	opt := func(o *Options) {
+		fc.writer = io.MultiWriter(o.writer, f)
+		o.writer = fc
+	}
+
+	return opt, fc, nil
 }
 
 // WithWriter sets the output destination

@@ -1,0 +1,272 @@
+---
+title: Middleware
+description: Built-in middleware and how to create custom middleware
+---
+
+# Middleware
+
+Surf provides a comprehensive set of built-in middleware and supports two middleware patterns: standard middleware and Before/After handlers.
+
+## Standard Middleware
+
+Standard middleware wraps the entire request handler:
+
+```go
+app.Use(surf.RecoveryWithDefaults())
+app.Use(surf.CORSWithDefaults())
+app.Use(surf.RateLimitWithDefaults())
+```
+
+### CORS
+
+Cross-Origin Resource Sharing middleware:
+
+```go
+// Default configuration (allows all origins)
+app.Use(surf.CORSWithDefaults())
+
+// Custom configuration
+app.Use(surf.CORS(surf.CORSConfig{
+    AllowOrigins:     []string{"https://example.com", "https://api.example.com"},
+    AllowMethods:     []string{"GET", "POST", "PUT", "DELETE"},
+    AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
+    ExposeHeaders:    []string{"X-Request-ID"},
+    AllowCredentials: true,
+    MaxAge:           86400, // 24 hours
+}))
+```
+
+### Recovery
+
+Panic recovery middleware prevents crashes:
+
+```go
+// Default configuration
+app.Use(surf.RecoveryWithDefaults())
+
+// Custom configuration
+app.Use(surf.Recovery(surf.RecoveryConfig{
+    Logger:    slog.Default(),
+    StackSize: 4 << 10, // 4KB stack trace
+
+    RecoveryHandler: func(w http.ResponseWriter, r *http.Request, err interface{}) {
+        // Custom error response
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusInternalServerError)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error": "Internal server error",
+        })
+    },
+}))
+```
+
+### Rate Limiting
+
+Token bucket rate limiter:
+
+```go
+// Default: 10 requests/second, burst of 20
+app.Use(surf.RateLimitWithDefaults())
+
+// Custom configuration
+app.Use(surf.RateLimit(surf.RateLimitConfig{
+    RequestsPerSecond: 100,
+    Burst:             200,
+
+    // Custom key function (default: IP address)
+    KeyFunc: func(r *http.Request) string {
+        return r.Header.Get("X-API-Key")
+    },
+
+    // Skip certain requests
+    SkipFunc: func(r *http.Request) bool {
+        return r.URL.Path == "/health"
+    },
+
+    // Custom exceeded handler
+    ExceededHandler: func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusTooManyRequests)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error": "Rate limit exceeded",
+        })
+    },
+}))
+```
+
+### Timeout
+
+Request timeout middleware:
+
+```go
+// Default: 30 seconds
+app.Use(surf.TimeoutWithDefaults())
+
+// Custom configuration
+app.Use(surf.Timeout(surf.TimeoutConfig{
+    Timeout: 10 * time.Second,
+
+    TimeoutHandler: func(w http.ResponseWriter, r *http.Request) {
+        w.Header().Set("Content-Type", "application/json")
+        w.WriteHeader(http.StatusGatewayTimeout)
+        json.NewEncoder(w).Encode(map[string]string{
+            "error": "Request timed out",
+        })
+    },
+}))
+```
+
+### Gzip Compression
+
+Response compression middleware:
+
+```go
+// Default configuration
+app.Use(surf.GzipWithDefaults())
+
+// Custom configuration
+app.Use(surf.Gzip(surf.GzipConfig{
+    Level:   gzip.BestSpeed,
+    MinSize: 1024, // Only compress responses > 1KB
+
+    ContentTypes: []string{
+        "text/html",
+        "text/css",
+        "application/json",
+        "application/javascript",
+    },
+
+    SkipFunc: func(r *http.Request) bool {
+        return strings.HasPrefix(r.URL.Path, "/api/stream")
+    },
+}))
+```
+
+## Before/After Handlers
+
+For simpler use cases, use Before/After handlers:
+
+```go
+// Runs before the main handler
+app.Before(func(w http.ResponseWriter, r *http.Request) error {
+    // Authentication, logging, etc.
+    return nil
+})
+
+// Runs after the main handler
+app.After(func(w http.ResponseWriter, r *http.Request) error {
+    // Cleanup, metrics, etc.
+    return nil
+})
+```
+
+### Group-Specific Handlers
+
+Apply handlers to specific route groups:
+
+```go
+api := app.Group("/api")
+
+// These only apply to /api/* routes
+api.Before(func(w http.ResponseWriter, r *http.Request) error {
+    w.Header().Set("Content-Type", "application/json")
+    return nil
+})
+
+api.After(func(w http.ResponseWriter, r *http.Request) error {
+    // Log API requests
+    return nil
+})
+```
+
+## Custom Middleware
+
+Create your own middleware:
+
+```go
+// Standard middleware pattern
+func LoggingMiddleware(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        start := time.Now()
+
+        // Call next handler
+        next.ServeHTTP(w, r)
+
+        // Log after request
+        slog.Info("request",
+            "method", r.Method,
+            "path", r.URL.Path,
+            "duration", time.Since(start),
+        )
+    })
+}
+
+// Use it
+app.Use(LoggingMiddleware)
+```
+
+### Middleware with Configuration
+
+```go
+type AuthConfig struct {
+    TokenHeader string
+    SkipPaths   []string
+}
+
+func Auth(config AuthConfig) surf.Middleware {
+    return func(next http.Handler) http.Handler {
+        return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+            // Skip certain paths
+            for _, path := range config.SkipPaths {
+                if r.URL.Path == path {
+                    next.ServeHTTP(w, r)
+                    return
+                }
+            }
+
+            // Check token
+            token := r.Header.Get(config.TokenHeader)
+            if token == "" {
+                http.Error(w, "Unauthorized", http.StatusUnauthorized)
+                return
+            }
+
+            // Validate token...
+
+            next.ServeHTTP(w, r)
+        })
+    }
+}
+
+// Use it
+app.Use(Auth(AuthConfig{
+    TokenHeader: "Authorization",
+    SkipPaths:   []string{"/health", "/public"},
+}))
+```
+
+## Middleware Order
+
+Middleware executes in the order it's added:
+
+```go
+app.Use(RecoveryMiddleware)  // 1st: Catches panics from all below
+app.Use(LoggingMiddleware)   // 2nd: Logs all requests
+app.Use(AuthMiddleware)      // 3rd: Checks authentication
+app.Use(RateLimitMiddleware) // 4th: Rate limits authenticated users
+```
+
+<Callout type="warn">
+  Always add Recovery middleware first to catch panics from other middleware.
+</Callout>
+
+## Next Steps
+
+<Cards>
+  <Card title="Helpers" href="/docs/helpers">
+    Query parameters and redirect helpers
+  </Card>
+  <Card title="Error Handling" href="/docs/error-handling">
+    Custom 404 and 405 handlers
+  </Card>
+</Cards>

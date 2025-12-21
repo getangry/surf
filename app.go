@@ -2,37 +2,61 @@ package surf
 
 import (
 	"context"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 )
 
+// ServerConfig holds HTTP server configuration
+type ServerConfig struct {
+	Addr           string
+	ReadTimeout    time.Duration
+	WriteTimeout   time.Duration
+	IdleTimeout    time.Duration
+	MaxHeaderBytes int
+}
+
+// DefaultServerConfig returns sensible defaults for production use
+func DefaultServerConfig() ServerConfig {
+	return ServerConfig{
+		Addr:           ":8080",
+		ReadTimeout:    15 * time.Second,
+		WriteTimeout:   15 * time.Second,
+		IdleTimeout:    60 * time.Second,
+		MaxHeaderBytes: 1 << 20, // 1MB
+	}
+}
+
 // App represents the Surf application with context, logger, and shutdown handling.
 type App struct {
-	ctx         context.Context
-	logger      *slog.Logger
-	cancel      context.CancelFunc
-	shutdown    chan os.Signal
-	services    map[any]any
-	router      *Router
-	before      []HandlerFunc
-	after       []HandlerFunc
-	middlewares []Middleware
+	ctx              context.Context
+	logger           *slog.Logger
+	cancel           context.CancelFunc
+	shutdown         chan os.Signal
+	services         map[any]any
+	servicesMu       sync.RWMutex
+	router           *Router
+	before           []HandlerFunc
+	after            []HandlerFunc
+	middlewares      []Middleware
+	serverConfig     ServerConfig
+	notFoundHandler  http.HandlerFunc
+	methodNotAllowed http.HandlerFunc
 }
 
 // NewApp initializes a new Surf application instance with context and signal handling.
 // It sets up a context that can be cancelled and listens for OS signals to gracefully shut down the application.
 // The application can be customized with options like a custom logger.
 func NewApp(options ...Option) *App {
-
 	app := &App{
-		logger:   slog.Default().WithGroup("surf"),
-		router:   NewRouter(),
-		services: make(map[any]any),
+		logger:       slog.Default().WithGroup("surf"),
+		router:       NewRouter(),
+		services:     make(map[any]any),
+		serverConfig: DefaultServerConfig(),
 	}
 
 	for _, opt := range options {
@@ -54,7 +78,6 @@ func NewApp(options ...Option) *App {
 	}
 
 	return app
-
 }
 
 // Serve starts the HTTP server and handles graceful shutdown.
@@ -62,16 +85,20 @@ func (app *App) Serve() error {
 	// Validates that context is still active
 	select {
 	case <-app.ctx.Done():
-		app.logger.Error("ERROR: Context already cancelled before server start")
+		app.logger.Error("context already cancelled before server start")
 		return app.ctx.Err()
 	default:
-		log.Println("Context is active, proceeding with server setup")
+		app.logger.Debug("context is active, proceeding with server setup")
 	}
 
-	// Creates HTTP server
+	// Creates HTTP server with timeouts to prevent slowloris attacks
 	server := &http.Server{
-		Addr:    ":8080",
-		Handler: app,
+		Addr:           app.serverConfig.Addr,
+		Handler:        app,
+		ReadTimeout:    app.serverConfig.ReadTimeout,
+		WriteTimeout:   app.serverConfig.WriteTimeout,
+		IdleTimeout:    app.serverConfig.IdleTimeout,
+		MaxHeaderBytes: app.serverConfig.MaxHeaderBytes,
 	}
 
 	// Channel captures server startup/runtime errors
@@ -79,62 +106,75 @@ func (app *App) Serve() error {
 
 	// Starts HTTP server in goroutine for concurrent signal listening
 	go func() {
-		log.Println("Starting HTTP server on :8080")
+		app.logger.Info("starting HTTP server", "addr", app.serverConfig.Addr)
 		err := server.ListenAndServe()
 		if err != nil && err != http.ErrServerClosed {
-			log.Printf("Server error occurred: %v", err)
+			app.logger.Error("server error occurred", "error", err)
 			serverErr <- err
 		} else {
-			log.Println("Server stopped cleanly")
+			app.logger.Debug("server stopped cleanly")
 			serverErr <- nil
 		}
 	}()
 
-	log.Println("Server started, waiting for shutdown signal or error")
+	app.logger.Debug("server started, waiting for shutdown signal or error")
 
 	// Block until shutdown signal, context cancellation, or server error
 	select {
 	case <-app.ctx.Done():
-		log.Println("Context cancelled, initiating shutdown")
+		app.logger.Info("context cancelled, initiating shutdown")
 	case sig := <-app.shutdown:
-		print("\b\b")
-		slog.With("_c", "white").Info("Received OS signal, initiating shutdown", "signal", sig)
+		app.logger.Info("received OS signal, initiating shutdown", "signal", sig)
 		app.cancel() // Cancels context to signal other components
 	case err := <-serverErr:
 		if err != nil {
-			log.Printf("Server error triggered shutdown: %v", err)
+			app.logger.Error("server error triggered shutdown", "error", err)
 			return err
 		}
-		log.Println("Server stopped without error")
+		app.logger.Debug("server stopped without error")
 	}
 
 	// Perform graceful shutdown with timeout
-	log.Println("Beginning graceful shutdown")
+	app.logger.Info("beginning graceful shutdown")
 	ctxShutdown, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctxShutdown); err != nil {
-		log.Printf("Graceful shutdown failed: %v", err)
+		app.logger.Error("graceful shutdown failed", "error", err)
 		return err
 	}
 
-	log.Println("Shutdown completed successfully")
+	app.logger.Info("shutdown completed successfully")
 	return nil
 }
 
-// Set registers a service in the application's service container
+// Set registers a service in the application's service container (thread-safe)
 func (app *App) Set(key any, service any) {
+	app.servicesMu.Lock()
 	app.services[key] = service
+	app.servicesMu.Unlock()
 }
 
-// GetService retrieves a service from the application's service container
+// GetService retrieves a service from the application's service container (thread-safe)
 func (app *App) GetService(key any) any {
+	app.servicesMu.RLock()
+	defer app.servicesMu.RUnlock()
 	return app.services[key]
 }
 
 // Cleanup stops signal notification and cancels context
 func (app *App) Cleanup() {
-	log.Println("Cleaning up application resources")
+	app.logger.Info("cleaning up application resources")
 	signal.Stop(app.shutdown)
 	app.cancel()
+}
+
+// NotFound sets a custom handler for 404 Not Found responses.
+func (app *App) NotFound(handler http.HandlerFunc) {
+	app.notFoundHandler = handler
+}
+
+// MethodNotAllowed sets a custom handler for 405 Method Not Allowed responses.
+func (app *App) MethodNotAllowed(handler http.HandlerFunc) {
+	app.methodNotAllowed = handler
 }

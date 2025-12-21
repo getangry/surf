@@ -1,0 +1,177 @@
+---
+title: Static Files
+description: Serve static files and directories with Surf
+---
+
+# Static Files
+
+Surf provides built-in support for serving static files with security features like directory traversal protection.
+
+## Serving a Directory
+
+Serve all files from a directory:
+
+```go
+app := surf.NewApp()
+
+// Serve files from ./public at /static/*
+app.Static("/static", "./public")
+
+// Files are accessible at:
+// /static/css/style.css  → ./public/css/style.css
+// /static/js/app.js      → ./public/js/app.js
+// /static/images/logo.png → ./public/images/logo.png
+```
+
+### Directory Structure Example
+
+```
+project/
+├── main.go
+└── public/
+    ├── css/
+    │   └── style.css
+    ├── js/
+    │   └── app.js
+    └── images/
+        └── logo.png
+```
+
+```go
+app.Static("/assets", "./public")
+```
+
+## Serving a Single File
+
+Serve individual files at specific paths:
+
+```go
+// Favicon
+app.StaticFile("/favicon.ico", "./public/favicon.ico")
+
+// Robots.txt
+app.StaticFile("/robots.txt", "./public/robots.txt")
+
+// Sitemap
+app.StaticFile("/sitemap.xml", "./public/sitemap.xml")
+```
+
+## Security Features
+
+### Directory Traversal Protection
+
+Surf automatically blocks directory traversal attacks:
+
+```go
+app.Static("/files", "./uploads")
+
+// These requests are blocked and return 404:
+// /files/../../../etc/passwd
+// /files/..%2F..%2F..%2Fetc%2Fpasswd
+```
+
+<Callout type="warn">
+  Always use `app.Static()` instead of implementing your own file server to ensure proper security.
+</Callout>
+
+### File Existence Check
+
+Non-existent files return 404 Not Found:
+
+```go
+// Request: GET /static/nonexistent.txt
+// Response: 404 Not Found
+```
+
+### Directory Listing Disabled
+
+Directory browsing is disabled by default:
+
+```go
+// Request: GET /static/
+// Response: 404 Not Found (not a directory listing)
+```
+
+## Complete Example
+
+```go
+package main
+
+import (
+    "net/http"
+    "github.com/getangry/surf"
+)
+
+func main() {
+    app := surf.NewApp()
+
+    // Serve static assets
+    app.Static("/assets", "./public/assets")
+
+    // Serve specific files
+    app.StaticFile("/favicon.ico", "./public/favicon.ico")
+    app.StaticFile("/robots.txt", "./public/robots.txt")
+
+    // API routes
+    app.Get("/api/users", listUsers)
+
+    // SPA fallback - serve index.html for unmatched routes
+    app.NotFound(func(w http.ResponseWriter, r *http.Request) {
+        http.ServeFile(w, r, "./public/index.html")
+    })
+
+    app.Serve()
+}
+```
+
+## Single Page Application (SPA) Support
+
+For SPAs, serve `index.html` for all non-API routes:
+
+```go
+app := surf.NewApp()
+
+// API routes
+api := app.Group("/api")
+api.Get("/users", listUsers)
+api.Get("/posts", listPosts)
+
+// Static assets
+app.Static("/assets", "./dist/assets")
+
+// SPA fallback
+app.NotFound(func(w http.ResponseWriter, r *http.Request) {
+    // Don't serve index.html for API routes
+    if strings.HasPrefix(r.URL.Path, "/api/") {
+        http.Error(w, "Not Found", http.StatusNotFound)
+        return
+    }
+    http.ServeFile(w, r, "./dist/index.html")
+})
+```
+
+## Content Types
+
+Surf automatically sets the correct `Content-Type` header based on file extension:
+
+| Extension | Content-Type |
+|-----------|-------------|
+| `.html` | `text/html` |
+| `.css` | `text/css` |
+| `.js` | `application/javascript` |
+| `.json` | `application/json` |
+| `.png` | `image/png` |
+| `.jpg`, `.jpeg` | `image/jpeg` |
+| `.svg` | `image/svg+xml` |
+| `.woff2` | `font/woff2` |
+
+## Next Steps
+
+<Cards>
+  <Card title="Error Handling" href="/docs/error-handling">
+    Custom 404 and 405 handlers
+  </Card>
+  <Card title="API Reference" href="/docs/api-reference">
+    Complete API documentation
+  </Card>
+</Cards>

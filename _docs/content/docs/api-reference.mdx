@@ -1,0 +1,542 @@
+---
+title: API Reference
+description: Complete API documentation for Surf
+---
+
+# API Reference
+
+Complete reference for all Surf functions and types.
+
+## Application
+
+### NewApp
+
+Creates a new Surf application.
+
+```go
+func NewApp(options ...Option) *App
+```
+
+**Options:**
+
+```go
+// Custom logger
+app := surf.NewApp(surf.WithLogger(slog.Default()))
+
+// Custom server configuration
+app := surf.NewApp(surf.WithServerConfig(surf.ServerConfig{
+    Addr:           ":3000",
+    ReadTimeout:    15 * time.Second,
+    WriteTimeout:   15 * time.Second,
+    IdleTimeout:    60 * time.Second,
+    MaxHeaderBytes: 1 << 20,
+}))
+
+// Individual options
+app := surf.NewApp(
+    surf.WithAddr(":3000"),
+    surf.WithReadTimeout(30 * time.Second),
+    surf.WithWriteTimeout(30 * time.Second),
+    surf.WithIdleTimeout(120 * time.Second),
+    surf.WithMaxHeaderBytes(2 << 20),
+    surf.WithContext(ctx),
+    surf.WithShutdownChannel(shutdownChan),
+)
+```
+
+### Available Options
+
+| Option | Description |
+|--------|-------------|
+| `WithLogger(logger)` | Custom slog.Logger |
+| `WithServerConfig(config)` | Complete ServerConfig |
+| `WithAddr(addr)` | Server listen address |
+| `WithReadTimeout(d)` | Request read timeout |
+| `WithWriteTimeout(d)` | Response write timeout |
+| `WithIdleTimeout(d)` | Keep-alive idle timeout |
+| `WithMaxHeaderBytes(n)` | Max header size |
+| `WithContext(ctx)` | Custom base context |
+| `WithShutdownChannel(ch)` | Custom shutdown signal channel |
+| `WithCancelFunc(cancel)` | Custom context cancel function |
+
+### Option Type
+
+```go
+type Option func(*App)
+```
+
+### DefaultServerConfig
+
+Returns sensible defaults for production use.
+
+```go
+func DefaultServerConfig() ServerConfig
+```
+
+### Serve
+
+Starts the HTTP server with graceful shutdown.
+
+```go
+func (app *App) Serve() error
+```
+
+### Cleanup
+
+Manually clean up application resources.
+
+```go
+func (app *App) Cleanup()
+```
+
+### ServeHTTP
+
+Implements `http.Handler` interface, allowing the app to be used with any HTTP server.
+
+```go
+func (app *App) ServeHTTP(w http.ResponseWriter, r *http.Request)
+```
+
+---
+
+## Routing
+
+### HTTP Methods
+
+```go
+func (app *App) Get(pattern string, handler HandlerFunc)
+func (app *App) Post(pattern string, handler HandlerFunc)
+func (app *App) Put(pattern string, handler HandlerFunc)
+func (app *App) Delete(pattern string, handler HandlerFunc)
+func (app *App) Patch(pattern string, handler HandlerFunc)
+func (app *App) Head(pattern string, handler HandlerFunc)
+func (app *App) Options(pattern string, handler HandlerFunc)
+```
+
+### Route Groups
+
+```go
+func (app *App) Group(prefix string) *Group
+
+// Group methods
+func (g *Group) Get(pattern string, handler HandlerFunc)
+func (g *Group) Post(pattern string, handler HandlerFunc)
+func (g *Group) Put(pattern string, handler HandlerFunc)
+func (g *Group) Delete(pattern string, handler HandlerFunc)
+func (g *Group) Patch(pattern string, handler HandlerFunc)
+func (g *Group) Head(pattern string, handler HandlerFunc)
+func (g *Group) Options(pattern string, handler HandlerFunc)
+func (g *Group) Group(prefix string) *Group
+func (g *Group) Before(handler HandlerFunc) *Group
+func (g *Group) After(handler HandlerFunc) *Group
+```
+
+### Handler Signature
+
+```go
+type HandlerFunc func(w http.ResponseWriter, r *http.Request) error
+```
+
+### Middleware Types
+
+```go
+type Middleware func(next http.Handler) http.Handler
+type MiddlewareFunc func(w http.ResponseWriter, r *http.Request, next http.HandlerFunc)
+```
+
+### Route Errors
+
+```go
+type ErrRouteConflict struct {
+    Method  string
+    Pattern string
+}
+
+func (e ErrRouteConflict) Error() string
+```
+
+### Internal Types (Advanced)
+
+```go
+// Router handles HTTP routing with radix tree for fast lookups
+type Router struct { ... }
+func NewRouter() *Router
+
+// Group represents a route group with prefix and middleware
+type Group struct { ... }
+```
+
+---
+
+## Middleware
+
+### Standard Middleware
+
+```go
+func (app *App) Use(middleware Middleware)
+func (app *App) UseFunc(fn MiddlewareFunc)
+```
+
+### Before/After Handlers
+
+```go
+func (app *App) Before(handler HandlerFunc)
+func (app *App) After(handler HandlerFunc)
+```
+
+### Built-in Middleware
+
+| Function | Description |
+|----------|-------------|
+| `CORSWithDefaults()` | CORS with permissive defaults |
+| `CORS(config)` | CORS with custom configuration |
+| `RecoveryWithDefaults()` | Panic recovery with defaults |
+| `Recovery(config)` | Panic recovery with custom configuration |
+| `RateLimitWithDefaults()` | Rate limiting (10 req/s, burst 20) |
+| `RateLimit(config)` | Rate limiting with custom configuration |
+| `TimeoutWithDefaults()` | 30 second request timeout |
+| `Timeout(config)` | Custom timeout configuration |
+| `GzipWithDefaults()` | Gzip compression with defaults |
+| `Gzip(config)` | Gzip with custom configuration |
+
+### Default Config Functions
+
+```go
+func DefaultCORSConfig() CORSConfig
+func DefaultRecoveryConfig() RecoveryConfig
+func DefaultRateLimitConfig() RateLimitConfig
+func DefaultTimeoutConfig() TimeoutConfig
+func DefaultGzipConfig() GzipConfig
+```
+
+### Logging Middleware
+
+| Function | Description |
+|----------|-------------|
+| `LoggingMiddleware(format)` | Template-based logging (Middleware) |
+| `Logger(format)` | Template-based logging (http.Handler wrapper) |
+| `SimpleLogger(format)` | After handler for logging |
+| `RequestIDMiddleware(prefix)` | Generates unique request IDs (Middleware) |
+| `RequestIDFunc(prefix)` | Generates unique request IDs (MiddlewareFunc) |
+| `RequestID(prefix)` | Generates unique request IDs (http.Handler wrapper) |
+| `SlogMiddleware(logger)` | Structured logging with slog (deprecated) |
+| `SlogMiddlewareWithLevel(logger, level)` | Slog with custom level |
+| `ReefCompatibleMiddleware(logger)` | Reef-compatible structured logging |
+| `CombinedMiddleware(format, logger)` | Both text and structured logging |
+| `RequestLogger(logger)` | Request logging with slog |
+| `RequestLoggerInjector(logger)` | Injects logger into request context |
+| `RequestLoggerWithOptions(opts)` | Request logger with custom options |
+| `LoggerMiddleware(format)` | Before handler for logging (deprecated) |
+| `LoggerAfter(format)` | After handler for logging (deprecated) |
+| `SlogMiddlewareWithOptions(opts)` | Slog with options (deprecated, use RequestLoggerWithOptions) |
+
+### Deprecated Aliases
+
+```go
+type SlogOptions = RequestLoggerOptions  // Deprecated: use RequestLoggerOptions
+func DefaultSlogOptions() *RequestLoggerOptions  // Deprecated: use DefaultRequestLoggerOptions
+```
+
+### Logger Helper Functions
+
+```go
+// Get/set logger in request context
+func WithRequestLogger(r *http.Request, logger *slog.Logger) *http.Request
+func GetRequestLogger(r *http.Request) *slog.Logger
+
+// Create logger with request context (includes request_id, user_id)
+func LoggerFromRequest(r *http.Request, baseLogger *slog.Logger) *slog.Logger
+```
+
+---
+
+## Query Helpers
+
+### String
+
+```go
+func Query(r *http.Request, key string) string
+func QueryDefault(r *http.Request, key, defaultVal string) string
+```
+
+### Numeric
+
+```go
+func QueryInt(r *http.Request, key string, defaultVal int) int
+func QueryInt64(r *http.Request, key string, defaultVal int64) int64
+func QueryFloat(r *http.Request, key string, defaultVal float64) float64
+```
+
+### Boolean
+
+```go
+func QueryBool(r *http.Request, key string, defaultVal bool) bool
+```
+
+Accepts: `true`, `1`, `yes`, `on` (case-insensitive)
+
+### Slice
+
+```go
+func QuerySlice(r *http.Request, key string) []string
+```
+
+---
+
+## Path Parameters
+
+```go
+func Param(r *http.Request, key string) string
+```
+
+---
+
+## Redirects
+
+```go
+func Redirect(w http.ResponseWriter, r *http.Request, url string, code int)
+func RedirectPermanent(w http.ResponseWriter, r *http.Request, url string)  // 301
+func RedirectTemporary(w http.ResponseWriter, r *http.Request, url string)  // 302
+func RedirectSeeOther(w http.ResponseWriter, r *http.Request, url string)   // 303
+```
+
+---
+
+## Static Files
+
+```go
+func (app *App) Static(prefix, dir string)
+func (app *App) StaticFile(path, file string)
+```
+
+---
+
+## Error Handlers
+
+```go
+func (app *App) NotFound(handler http.HandlerFunc)
+func (app *App) MethodNotAllowed(handler http.HandlerFunc)
+```
+
+### Handler Types
+
+```go
+type NotFoundHandler func(w http.ResponseWriter, r *http.Request)
+type MethodNotAllowedHandler func(w http.ResponseWriter, r *http.Request, allowedMethods []string)
+```
+
+---
+
+## Service Container
+
+```go
+func (app *App) Set(key any, service any)
+func (app *App) GetService(key any) any
+func GetService[T any](r *http.Request, key any) T
+```
+
+---
+
+## Request Context Storage
+
+```go
+// Basic storage (uses *http.Request directly)
+func Store(r *http.Request, key string, value interface{})
+func Get(r *http.Request, key string) (interface{}, bool)
+func GetString(r *http.Request, key string, defaultVal string) string
+func GetInt(r *http.Request, key string, defaultVal int) int
+func Delete(r *http.Request)
+func MustGet(r *http.Request, key string) interface{}
+
+// Pointer-based storage (for modifying request)
+func Set(r **http.Request, key string, value interface{})
+func SetMultiple(r **http.Request, values map[string]interface{})
+func SetRequestID(r **http.Request, id string)
+func SetUserID(r **http.Request, userID string)
+
+// Getters
+func GetRequestID(r *http.Request) string
+func GetUserID(r *http.Request) string
+
+// Fluent interface
+func With(r **http.Request) *WithRequest
+func (wr *WithRequest) Set(key string, value interface{}) *WithRequest
+func (wr *WithRequest) SetRequestID(id string) *WithRequest
+func (wr *WithRequest) SetUserID(userID string) *WithRequest
+```
+
+### Usage Example
+
+```go
+// Using fluent interface
+app.Get("/users/:id", func(w http.ResponseWriter, r *http.Request) error {
+    surf.With(&r).
+        SetRequestID("req-123").
+        SetUserID("user-456").
+        Set("operation", "get_user")
+
+    // Later retrieve values
+    userID := surf.GetUserID(r)
+    requestID := surf.GetRequestID(r)
+    return nil
+})
+```
+
+---
+
+## Configuration Types
+
+### ServerConfig
+
+```go
+type ServerConfig struct {
+    Addr           string        // Default: ":8080"
+    ReadTimeout    time.Duration // Default: 15s
+    WriteTimeout   time.Duration // Default: 15s
+    IdleTimeout    time.Duration // Default: 60s
+    MaxHeaderBytes int           // Default: 1MB
+}
+```
+
+### CORSConfig
+
+```go
+type CORSConfig struct {
+    AllowOrigins     []string // Default: ["*"]
+    AllowMethods     []string // Default: all methods
+    AllowHeaders     []string // Default: common headers
+    ExposeHeaders    []string
+    AllowCredentials bool
+    MaxAge           int      // Default: 86400
+}
+```
+
+### RateLimitConfig
+
+```go
+type RateLimitConfig struct {
+    RequestsPerSecond float64                    // Default: 10
+    Burst             int                        // Default: 20
+    KeyFunc           func(r *http.Request) string
+    ExceededHandler   func(w http.ResponseWriter, r *http.Request)
+    SkipFunc          func(r *http.Request) bool
+}
+```
+
+### TimeoutConfig
+
+```go
+type TimeoutConfig struct {
+    Timeout        time.Duration // Default: 30s
+    TimeoutHandler func(w http.ResponseWriter, r *http.Request)
+}
+```
+
+### GzipConfig
+
+```go
+type GzipConfig struct {
+    Level        int      // gzip.DefaultCompression
+    MinSize      int      // Default: 1024
+    ContentTypes []string // Default: text/html, application/json, etc.
+    SkipFunc     func(r *http.Request) bool
+}
+```
+
+### RecoveryConfig
+
+```go
+type RecoveryConfig struct {
+    Logger            *slog.Logger
+    StackSize         int  // Default: 4KB
+    DisableStackAll   bool
+    DisablePrintStack bool
+    RecoveryHandler   func(w http.ResponseWriter, r *http.Request, err interface{})
+}
+```
+
+### RequestLoggerOptions
+
+```go
+type RequestLoggerOptions struct {
+    Logger             *slog.Logger
+    Level              slog.Level
+    IncludeReqHeaders  bool
+    IncludeRespHeaders bool
+    HeaderFilter       func(key string) bool  // Filter specific headers
+    GroupHeaders       bool                   // Group under "request_headers"/"response_headers"
+}
+
+func DefaultRequestLoggerOptions() *RequestLoggerOptions
+```
+
+### LogEntry Type
+
+The `LogEntry` type provides access to request/response data for logging templates.
+
+```go
+type LogEntry struct {
+    // ...
+}
+
+// Available methods for log templates
+func (e *LogEntry) Method() string
+func (e *LogEntry) Path() string
+func (e *LogEntry) Status() string
+func (e *LogEntry) StatusCode() int
+func (e *LogEntry) Size() string
+func (e *LogEntry) SizeBytes() int
+func (e *LogEntry) Latency() string
+func (e *LogEntry) LatencyMs() string
+func (e *LogEntry) RemoteAddr() string
+func (e *LogEntry) UserAgent() string
+func (e *LogEntry) Referer() string
+func (e *LogEntry) Proto() string
+func (e *LogEntry) Host() string
+func (e *LogEntry) RequestID() string
+func (e *LogEntry) UserID() string
+func (e *LogEntry) CustomVal(key string) string
+```
+
+---
+
+## ResponseWriter
+
+Enhanced response writer with metadata storage and metrics.
+
+```go
+type ResponseWriter struct {
+    http.ResponseWriter
+    // ...
+}
+
+// Constructor
+func NewResponseWriter(w http.ResponseWriter) *ResponseWriter
+
+// Metrics
+func (rw *ResponseWriter) Status() int
+func (rw *ResponseWriter) Size() int
+func (rw *ResponseWriter) Written() bool
+func (rw *ResponseWriter) StartTime() time.Time
+func (rw *ResponseWriter) Latency() time.Duration
+
+// Custom data storage (thread-safe)
+func (rw *ResponseWriter) Set(key string, value interface{})
+func (rw *ResponseWriter) Get(key string) (interface{}, bool)
+func (rw *ResponseWriter) GetString(key string, defaultVal string) string
+func (rw *ResponseWriter) CustomData() map[string]interface{}
+
+// HTTP interface implementations
+func (rw *ResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error)
+func (rw *ResponseWriter) Flush()
+func (rw *ResponseWriter) Push(target string, opts *http.PushOptions) error
+func (rw *ResponseWriter) CloseNotify() <-chan bool  // Deprecated
+func (rw *ResponseWriter) ResponseController() *http.ResponseController
+
+// Get ResponseWriter from request
+func GetResponseWriter(r *http.Request) *ResponseWriter
+
+// Helper functions to get response info from request
+func ResponseStatus(r *http.Request) int
+func ResponseSize(r *http.Request) int
+```

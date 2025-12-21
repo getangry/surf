@@ -5,23 +5,32 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
-	"log"
 	"log/slog"
 	"net/http"
 	"os"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
+// Pre-compiled regex for log template parsing (avoids compilation on every log call)
+var logTemplateRegex = regexp.MustCompile(`\{([^}]+)\}`)
+
 // Logger context helpers
 
-// Global storage for request context values (since the framework doesn't preserve context changes)
-var requestStorage = make(map[*http.Request]map[string]interface{})
+// Global storage for request context values with thread safety
+var (
+	requestStorage = make(map[*http.Request]map[string]interface{})
+	storageMutex   sync.RWMutex
+)
 
 // Set adds a value to the request storage (framework limitation workaround)
 func Set(r **http.Request, key string, value interface{}) {
+	storageMutex.Lock()
+	defer storageMutex.Unlock()
+
 	if requestStorage[*r] == nil {
 		requestStorage[*r] = make(map[string]interface{})
 	}
@@ -30,6 +39,9 @@ func Set(r **http.Request, key string, value interface{}) {
 
 // SetMultiple adds multiple values at once to request storage
 func SetMultiple(r **http.Request, values map[string]interface{}) {
+	storageMutex.Lock()
+	defer storageMutex.Unlock()
+
 	if requestStorage[*r] == nil {
 		requestStorage[*r] = make(map[string]interface{})
 	}
@@ -40,6 +52,9 @@ func SetMultiple(r **http.Request, values map[string]interface{}) {
 
 // Store directly sets a value for a request (internal use)
 func Store(r *http.Request, key string, value interface{}) {
+	storageMutex.Lock()
+	defer storageMutex.Unlock()
+
 	if requestStorage[r] == nil {
 		requestStorage[r] = make(map[string]interface{})
 	}
@@ -48,12 +63,15 @@ func Store(r *http.Request, key string, value interface{}) {
 
 // Get retrieves a value from the request storage or context
 func Get(r *http.Request, key string) (interface{}, bool) {
-	// First check our global storage
+	// First check our global storage with read lock
+	storageMutex.RLock()
 	if storage, exists := requestStorage[r]; exists {
 		if val, ok := storage[key]; ok {
+			storageMutex.RUnlock()
 			return val, true
 		}
 	}
+	storageMutex.RUnlock()
 
 	// Fallback to context
 	val := r.Context().Value(contextKey(key))
@@ -68,6 +86,13 @@ func GetString(r *http.Request, key string, defaultVal string) string {
 		}
 	}
 	return defaultVal
+}
+
+// Delete removes a request from storage
+func Delete(r *http.Request) {
+	storageMutex.Lock()
+	defer storageMutex.Unlock()
+	delete(requestStorage, r)
 }
 
 // GetInt retrieves an int value with a default
@@ -115,14 +140,22 @@ func GetUserID(r *http.Request) string {
 
 // GetService retrieves a service from the application's service container
 // It requires access to the application instance through the request context
+// Returns zero value if service not found or type assertion fails
 func GetService[T any](r *http.Request, key any) T {
-	if app, ok := r.Context().Value(appKey{}).(*App); ok {
-		if service := app.GetService(key); service != nil {
-			return service.(T)
-		}
-	}
 	var zero T
-	return zero
+	app, ok := r.Context().Value(appKey{}).(*App)
+	if !ok {
+		return zero
+	}
+	service := app.GetService(key)
+	if service == nil {
+		return zero
+	}
+	typed, ok := service.(T)
+	if !ok {
+		return zero
+	}
+	return typed
 }
 
 // WithRequest provides a fluent interface for setting multiple context values
@@ -285,10 +318,7 @@ func formatValue(val interface{}) string {
 
 // formatLog formats the log entry according to the template
 func formatLog(template string, entry *LogEntry) string {
-	// Regex to find all tokens
-	re := regexp.MustCompile(`\{([^}]+)\}`)
-
-	return re.ReplaceAllStringFunc(template, func(match string) string {
+	return logTemplateRegex.ReplaceAllStringFunc(template, func(match string) string {
 		token := strings.Trim(match, "{}")
 
 		if strings.HasPrefix(token, "$") {
@@ -331,31 +361,56 @@ func formatLog(template string, entry *LogEntry) string {
 	})
 }
 
+// loggerStartTimes provides thread-safe storage for request start times
+type loggerStartTimes struct {
+	mu    sync.RWMutex
+	times map[*http.Request]time.Time
+}
+
+func newLoggerStartTimes() *loggerStartTimes {
+	return &loggerStartTimes{
+		times: make(map[*http.Request]time.Time),
+	}
+}
+
+func (l *loggerStartTimes) set(r *http.Request, t time.Time) {
+	l.mu.Lock()
+	l.times[r] = t
+	l.mu.Unlock()
+}
+
+func (l *loggerStartTimes) getAndDelete(r *http.Request) (time.Time, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	t, ok := l.times[r]
+	if ok {
+		delete(l.times, r)
+	}
+	return t, ok
+}
+
 // LoggerMiddleware creates a simple After middleware for logging
 // Since the framework doesn't propagate context changes from Before middlewares,
 // we'll use a global map to track start times by request
 func LoggerMiddleware(format string) HandlerFunc {
-	startTimes := make(map[*http.Request]time.Time)
+	startTimes := newLoggerStartTimes()
 
 	// This should be used as a Before middleware
 	return func(w http.ResponseWriter, r *http.Request) error {
-		startTimes[r] = time.Now()
+		startTimes.set(r, time.Now())
 		return nil
 	}
 }
 
 // LoggerAfter creates the After middleware for logging
 func LoggerAfter(format string) HandlerFunc {
-	startTimes := make(map[*http.Request]time.Time)
+	startTimes := newLoggerStartTimes()
 
 	return func(w http.ResponseWriter, r *http.Request) error {
-		start, ok := startTimes[r]
+		start, ok := startTimes.getAndDelete(r)
 		if !ok {
 			start = time.Now()
 		}
-
-		// Clean up
-		delete(startTimes, r)
 
 		// Get the ResponseWriter from context
 		rw := GetResponseWriter(r)
@@ -370,7 +425,7 @@ func LoggerAfter(format string) HandlerFunc {
 			latency: time.Since(start),
 		}
 
-		log.Println(formatLog(format, entry))
+		slog.Info(formatLog(format, entry))
 		return nil
 	}
 }
@@ -378,6 +433,9 @@ func LoggerAfter(format string) HandlerFunc {
 // SimpleLogger creates just an After middleware for logging (no Before needed)
 func SimpleLogger(format string) HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) error {
+		// Always clean up request storage, even on early returns
+		defer Delete(r)
+
 		// Get the ResponseWriter from context
 		rw := GetResponseWriter(r)
 		if rw == nil {
@@ -392,10 +450,7 @@ func SimpleLogger(format string) HandlerFunc {
 			rw:      rw, // Add reference to ResponseWriter for custom data
 		}
 
-		log.Println(formatLog(format, entry))
-
-		// Clean up request storage after logging
-		delete(requestStorage, r)
+		slog.Info(formatLog(format, entry))
 
 		return nil
 	}
@@ -405,6 +460,9 @@ func SimpleLogger(format string) HandlerFunc {
 func LoggingMiddleware(format string) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Always clean up request storage
+			defer Delete(r)
+
 			// Wrap the response writer
 			rw := NewResponseWriter(w)
 
@@ -420,7 +478,7 @@ func LoggingMiddleware(format string) Middleware {
 				rw:      rw,
 			}
 
-			log.Println(formatLog(format, entry))
+			slog.Info(formatLog(format, entry))
 		})
 	}
 }
@@ -429,6 +487,9 @@ func LoggingMiddleware(format string) Middleware {
 func Logger(format string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Always clean up request storage
+			defer Delete(r)
+
 			start := time.Now()
 
 			// Wrap response writer to capture status and size
@@ -445,7 +506,7 @@ func Logger(format string) func(http.Handler) http.Handler {
 				latency: time.Since(start),
 			}
 
-			log.Println(formatLog(format, entry))
+			slog.Info(formatLog(format, entry))
 		})
 	}
 }
@@ -511,11 +572,14 @@ func RequestID(prefix string) func(http.Handler) http.Handler {
 	}
 }
 
-// generateRequestID creates a unique request ID
+// generateRequestID creates a unique request ID with sufficient entropy
 func generateRequestID(prefix string) string {
-	// Generate random bytes
-	b := make([]byte, 4)
-	rand.Read(b)
+	// Generate 16 random bytes (128 bits) for sufficient uniqueness
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		// Fallback to timestamp-based ID if crypto/rand fails
+		return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
+	}
 	id := hex.EncodeToString(b)
 
 	if prefix != "" {
@@ -637,8 +701,8 @@ func RequestLoggerWithOptions(opts *RequestLoggerOptions) Middleware {
 				}
 			}
 
-			// Add any other custom data from ResponseWriter
-			for key, value := range rw.customData {
+			// Add any other custom data from ResponseWriter (thread-safe copy)
+			for key, value := range rw.CustomData() {
 				if key != "request_id" { // Already handled above
 					attrs = append(attrs, slog.Any(key, value))
 				}
@@ -675,8 +739,8 @@ func SlogMiddlewareWithLevel(logger *slog.Logger, level slog.Level) Middleware {
 				slog.String("user_agent", r.UserAgent()),
 			}
 
-			// Add custom fields from ResponseWriter
-			for key, value := range rw.customData {
+			// Add custom fields from ResponseWriter (thread-safe copy)
+			for key, value := range rw.CustomData() {
 				attrs = append(attrs, slog.Any(key, value))
 			}
 
@@ -711,8 +775,8 @@ func ReefCompatibleMiddleware(logger *slog.Logger) Middleware {
 				"http.user_agent", r.UserAgent(),
 			)
 
-			// Add custom fields with namespacing
-			for key, value := range rw.customData {
+			// Add custom fields with namespacing (thread-safe copy)
+			for key, value := range rw.CustomData() {
 				logEntry = logEntry.With(fmt.Sprintf("app.%s", key), value)
 			}
 
@@ -746,7 +810,7 @@ func CombinedMiddleware(format string, slogger *slog.Logger) Middleware {
 			}
 
 			// Log with traditional logger using template
-			log.Println(formatLog(format, entry))
+			slog.Info(formatLog(format, entry))
 
 			// Also log with structured slog
 			attrs := []slog.Attr{
@@ -757,8 +821,8 @@ func CombinedMiddleware(format string, slogger *slog.Logger) Middleware {
 				slog.Duration("latency", rw.Latency()),
 			}
 
-			// Add custom fields
-			for key, value := range rw.customData {
+			// Add custom fields (thread-safe copy)
+			for key, value := range rw.CustomData() {
 				attrs = append(attrs, slog.Any(key, value))
 			}
 

@@ -2,9 +2,21 @@ package surf
 
 import (
 	"context"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 )
+
+// ErrRouteConflict is returned when a route pattern is already registered
+type ErrRouteConflict struct {
+	Method  string
+	Pattern string
+}
+
+func (e ErrRouteConflict) Error() string {
+	return fmt.Sprintf("route conflict: %s %s is already registered", e.Method, e.Pattern)
+}
 
 // HandlerFunc is the standard HTTP handler function signature using context.Context
 type HandlerFunc func(w http.ResponseWriter, r *http.Request) error
@@ -17,7 +29,8 @@ type MiddlewareFunc func(w http.ResponseWriter, r *http.Request, next http.Handl
 
 // Router handles HTTP routing with path parameters
 type Router struct {
-	routes map[string]map[string]*route
+	routes map[string]map[string]*route // Legacy map storage
+	trees  map[string]*radixTree        // Radix trees per method for fast lookup
 }
 
 // Group represents a route group with a common prefix and middleware
@@ -41,21 +54,47 @@ type route struct {
 func NewRouter() *Router {
 	return &Router{
 		routes: make(map[string]map[string]*route),
+		trees:  make(map[string]*radixTree),
 	}
 }
 
+// getAllowedMethods returns a list of HTTP methods that have routes for the given path
+func (r *Router) getAllowedMethods(path string) []string {
+	var methods []string
+	for method, tree := range r.trees {
+		if route, _ := tree.search(path); route != nil {
+			methods = append(methods, method)
+		}
+	}
+	return methods
+}
+
 // addRoute adds a route to the router
+// Logs a warning if the route pattern already exists (will be overwritten)
 func (r *Router) addRoute(method, pattern string, handler HandlerFunc) {
 	if r.routes[method] == nil {
 		r.routes[method] = make(map[string]*route)
 	}
+	if r.trees[method] == nil {
+		r.trees[method] = newRadixTree()
+	}
+
+	// Warn on route conflict (pattern already registered)
+	if _, exists := r.routes[method][pattern]; exists {
+		slog.Warn("route conflict: overwriting existing route",
+			"method", method,
+			"pattern", pattern,
+		)
+	}
 
 	params := extractParams(pattern)
-	r.routes[method][pattern] = &route{
+	rt := &route{
 		pattern: pattern,
 		handler: handler,
 		params:  params,
 	}
+	r.routes[method][pattern] = rt
+	r.trees[method].insert(pattern, rt)
 }
 
 // Get registers a GET route
@@ -193,15 +232,20 @@ func (g *Group) addRoute(method, pattern string, handler HandlerFunc) {
 	if g.app.router.routes[method] == nil {
 		g.app.router.routes[method] = make(map[string]*route)
 	}
+	if g.app.router.trees[method] == nil {
+		g.app.router.trees[method] = newRadixTree()
+	}
 
 	params := extractParams(fullPattern)
-	g.app.router.routes[method][fullPattern] = &route{
+	rt := &route{
 		pattern: fullPattern,
 		handler: handler,
 		params:  params,
 		before:  append([]HandlerFunc{}, g.before...),
 		after:   append([]HandlerFunc{}, g.after...),
 	}
+	g.app.router.routes[method][fullPattern] = rt
+	g.app.router.trees[method].insert(fullPattern, rt)
 }
 
 // ServeHTTP implements the http.Handler interface
@@ -229,6 +273,20 @@ func (app *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	app.serveLegacy(w, r)
 }
 
+// handleError logs the error internally and returns a generic error to the client
+func handleError(rw *ResponseWriter, r *http.Request, err error, context string) {
+	// Log the actual error internally for debugging
+	slog.Error("request handler error",
+		"error", err,
+		"context", context,
+		"method", r.Method,
+		"path", r.URL.Path,
+		"remote_addr", r.RemoteAddr,
+	)
+	// Return generic error to client to avoid leaking internal details
+	http.Error(rw, "Internal Server Error", http.StatusInternalServerError)
+}
+
 // serveLegacy handles the original Before/After middleware pattern
 func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
 	rw := NewResponseWriter(w)
@@ -238,60 +296,81 @@ func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
 
 	for _, handler := range app.before {
 		if err := handler(rw, r); err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			handleError(rw, r, err, "app.before")
 			return
 		}
 	}
 
-	if routes, ok := app.router.routes[r.Method]; ok {
-		for pattern, route := range routes {
-			if params, ok := matchPath(pattern, r.URL.Path); ok {
-				ctx := r.Context()
-				for key, value := range params {
-					ctx = context.WithValue(ctx, contextKey(key), value)
-				}
-				r = r.WithContext(ctx)
+	// Use radix tree for O(log n) route matching
+	if tree, ok := app.router.trees[r.Method]; ok {
+		if route, params := tree.search(r.URL.Path); route != nil {
+			ctx := r.Context()
+			for key, value := range params {
+				ctx = context.WithValue(ctx, contextKey(key), value)
+			}
+			r = r.WithContext(ctx)
 
-				for _, handler := range route.before {
-					if err := handler(rw, r); err != nil {
-						http.Error(rw, err.Error(), http.StatusInternalServerError)
-						return
-					}
-				}
-
-				if err := route.handler(rw, r); err != nil {
-					http.Error(rw, err.Error(), http.StatusInternalServerError)
+			for _, handler := range route.before {
+				if err := handler(rw, r); err != nil {
+					handleError(rw, r, err, "route.before")
 					return
 				}
+			}
 
-				for _, handler := range route.after {
-					if err := handler(rw, r); err != nil {
-						http.Error(rw, err.Error(), http.StatusInternalServerError)
-						return
-					}
-				}
-
-				for _, handler := range app.after {
-					if err := handler(rw, r); err != nil {
-						http.Error(rw, err.Error(), http.StatusInternalServerError)
-						return
-					}
-				}
+			if err := route.handler(rw, r); err != nil {
+				handleError(rw, r, err, "route.handler")
 				return
 			}
+
+			for _, handler := range route.after {
+				if err := handler(rw, r); err != nil {
+					handleError(rw, r, err, "route.after")
+					return
+				}
+			}
+
+			for _, handler := range app.after {
+				if err := handler(rw, r); err != nil {
+					handleError(rw, r, err, "app.after")
+					return
+				}
+			}
+			return
 		}
 	}
 
-	// No route found
-	http.NotFound(rw, r)
+	// Check if route exists for other methods (405 Method Not Allowed)
+	allowedMethods := app.router.getAllowedMethods(r.URL.Path)
+	if len(allowedMethods) > 0 {
+		if app.methodNotAllowed != nil {
+			rw.Header().Set("Allow", strings.Join(allowedMethods, ", "))
+			app.methodNotAllowed(rw, r)
+		} else {
+			rw.Header().Set("Allow", strings.Join(allowedMethods, ", "))
+			http.Error(rw, "Method Not Allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+
+	// No route found - 404
+	if app.notFoundHandler != nil {
+		app.notFoundHandler(rw, r)
+	} else {
+		http.NotFound(rw, r)
+	}
 }
 
 // Param extracts a path parameter from the request context
 func Param(r *http.Request, key string) string {
-	if value := r.Context().Value(contextKey(key)); value != nil {
-		return value.(string)
+	value := r.Context().Value(contextKey(key))
+	if value == nil {
+		return ""
 	}
-	return ""
+	str, ok := value.(string)
+	if !ok {
+		return ""
+	}
+	return str
 }
 
 // extractParams extracts parameter names from a route pattern
