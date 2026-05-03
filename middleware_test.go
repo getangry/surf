@@ -341,6 +341,136 @@ func TestRateLimitSkipFunc(t *testing.T) {
 	}
 }
 
+func TestRateLimitDefaultIgnoresXForwardedFor(t *testing.T) {
+	app := NewApp()
+	app.Use(RateLimit(RateLimitConfig{
+		RequestsPerSecond: 1,
+		Burst:             1,
+	}))
+	app.Get("/test", func(w http.ResponseWriter, r *http.Request) error {
+		w.Write([]byte("ok"))
+		return nil
+	})
+
+	// Both requests come from the same peer IP. Spoofed XFF must not
+	// create a separate bucket — the second request must be limited.
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "192.168.1.1:12345"
+	req.Header.Set("X-Forwarded-For", "10.0.0.1")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first request: status = %d, want 200", rec.Code)
+	}
+
+	req = httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "192.168.1.1:12345"
+	req.Header.Set("X-Forwarded-For", "10.0.0.2") // try to look like a different client
+	rec = httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("spoofed XFF should not bypass rate limit; status = %d, want 429", rec.Code)
+	}
+}
+
+func TestRateLimitIPv6PeerAddr(t *testing.T) {
+	app := NewApp()
+	app.Use(RateLimit(RateLimitConfig{
+		RequestsPerSecond: 1,
+		Burst:             1,
+	}))
+	app.Get("/test", func(w http.ResponseWriter, r *http.Request) error {
+		w.Write([]byte("ok"))
+		return nil
+	})
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "[2001:db8::1]:54321"
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("first IPv6 request: status = %d, want 200", rec.Code)
+	}
+
+	req = httptest.NewRequest("GET", "/test", nil)
+	req.RemoteAddr = "[2001:db8::1]:54322" // same host, different port
+	rec = httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Errorf("IPv6 same host different port should hit same bucket; status = %d, want 429", rec.Code)
+	}
+}
+
+func TestXForwardedForKeyFuncTrustedProxy(t *testing.T) {
+	keyFunc, err := XForwardedForKeyFunc([]string{"10.0.0.0/8"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("trusted peer honors XFF", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = "10.0.0.1:1234"
+		req.Header.Set("X-Forwarded-For", "203.0.113.5")
+		if got := keyFunc(req); got != "203.0.113.5" {
+			t.Errorf("got %q, want %q", got, "203.0.113.5")
+		}
+	})
+
+	t.Run("untrusted peer ignores XFF", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = "203.0.113.99:1234"
+		req.Header.Set("X-Forwarded-For", "10.0.0.1")
+		if got := keyFunc(req); got != "203.0.113.99" {
+			t.Errorf("got %q, want %q", got, "203.0.113.99")
+		}
+	})
+
+	t.Run("walks past trusted hops", func(t *testing.T) {
+		req := httptest.NewRequest("GET", "/", nil)
+		req.RemoteAddr = "10.0.0.1:1234"
+		req.Header.Set("X-Forwarded-For", "203.0.113.5, 10.0.0.2, 10.0.0.3")
+		if got := keyFunc(req); got != "203.0.113.5" {
+			t.Errorf("got %q, want %q", got, "203.0.113.5")
+		}
+	})
+
+	t.Run("invalid CIDR returns error", func(t *testing.T) {
+		_, err := XForwardedForKeyFunc([]string{"not-a-cidr"})
+		if err == nil {
+			t.Error("expected error for invalid CIDR")
+		}
+	})
+}
+
+func TestRateLimitStoreEvictsIdleBuckets(t *testing.T) {
+	store := newRateLimiterStore(1, 1, 3, 50*time.Millisecond)
+
+	// Fill to capacity with three keys.
+	store.get("a")
+	store.get("b")
+	store.get("c")
+	if got := len(store.limiters); got != 3 {
+		t.Fatalf("expected 3 buckets, got %d", got)
+	}
+
+	// Wait past idle window, then insert a new key. The store should
+	// evict idle buckets before adding.
+	time.Sleep(80 * time.Millisecond)
+	store.get("d")
+
+	store.mu.RLock()
+	size := len(store.limiters)
+	_, hasD := store.limiters["d"]
+	store.mu.RUnlock()
+
+	if size > 3 {
+		t.Errorf("store size = %d, want <= 3 after eviction", size)
+	}
+	if !hasD {
+		t.Error("newly inserted key 'd' should be present")
+	}
+}
+
 func TestTimeoutMiddleware(t *testing.T) {
 	app := NewApp()
 	app.Use(Timeout(TimeoutConfig{

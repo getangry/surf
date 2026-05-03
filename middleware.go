@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -219,7 +221,9 @@ type RateLimitConfig struct {
 	// Burst is the maximum burst size
 	Burst int
 
-	// KeyFunc returns a key to identify the client (default: IP address)
+	// KeyFunc returns a key to identify the client. Default: client IP from
+	// r.RemoteAddr. Forwarded-for headers are NOT trusted by default; use
+	// XForwardedForKeyFunc with an explicit trusted-proxy allowlist.
 	KeyFunc func(r *http.Request) string
 
 	// ExceededHandler is called when the rate limit is exceeded
@@ -228,9 +232,19 @@ type RateLimitConfig struct {
 
 	// SkipFunc returns true if the request should skip rate limiting
 	SkipFunc func(r *http.Request) bool
+
+	// MaxKeys caps the number of distinct client buckets retained. When the
+	// store grows past this, idle buckets (no traffic in IdleEvictAfter)
+	// are evicted opportunistically. Defaults to 100_000 if zero.
+	MaxKeys int
+
+	// IdleEvictAfter is the duration of inactivity after which a bucket is
+	// eligible for eviction. Defaults to 10 minutes if zero.
+	IdleEvictAfter time.Duration
 }
 
-// tokenBucket implements a simple token bucket rate limiter
+// tokenBucket implements a simple token bucket rate limiter.
+// lastUpdate doubles as the last-seen timestamp for eviction.
 type tokenBucket struct {
 	tokens     float64
 	lastUpdate time.Time
@@ -267,19 +281,29 @@ func (tb *tokenBucket) allow() bool {
 	return false
 }
 
-// rateLimiterStore stores rate limiters per client
-type rateLimiterStore struct {
-	limiters map[string]*tokenBucket
-	mu       sync.RWMutex
-	rate     float64
-	burst    int
+func (tb *tokenBucket) lastSeen() time.Time {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.lastUpdate
 }
 
-func newRateLimiterStore(rate float64, burst int) *rateLimiterStore {
+// rateLimiterStore stores rate limiters per client with bounded growth.
+type rateLimiterStore struct {
+	limiters       map[string]*tokenBucket
+	mu             sync.RWMutex
+	rate           float64
+	burst          int
+	maxKeys        int
+	idleEvictAfter time.Duration
+}
+
+func newRateLimiterStore(rate float64, burst, maxKeys int, idleEvictAfter time.Duration) *rateLimiterStore {
 	return &rateLimiterStore{
-		limiters: make(map[string]*tokenBucket),
-		rate:     rate,
-		burst:    burst,
+		limiters:       make(map[string]*tokenBucket),
+		rate:           rate,
+		burst:          burst,
+		maxKeys:        maxKeys,
+		idleEvictAfter: idleEvictAfter,
 	}
 }
 
@@ -287,7 +311,6 @@ func (s *rateLimiterStore) get(key string) *tokenBucket {
 	s.mu.RLock()
 	limiter, exists := s.limiters[key]
 	s.mu.RUnlock()
-
 	if exists {
 		return limiter
 	}
@@ -295,9 +318,12 @@ func (s *rateLimiterStore) get(key string) *tokenBucket {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Double-check after acquiring write lock
 	if limiter, exists = s.limiters[key]; exists {
 		return limiter
+	}
+
+	if len(s.limiters) >= s.maxKeys {
+		s.evictLocked()
 	}
 
 	limiter = newTokenBucket(s.rate, s.burst)
@@ -305,31 +331,115 @@ func (s *rateLimiterStore) get(key string) *tokenBucket {
 	return limiter
 }
 
-// DefaultRateLimitConfig returns a default rate limit configuration
+// evictLocked removes idle buckets. Caller must hold the write lock.
+// If no buckets are idle (high churn), drops the oldest tenth to bound growth.
+func (s *rateLimiterStore) evictLocked() {
+	cutoff := time.Now().Add(-s.idleEvictAfter)
+	for k, b := range s.limiters {
+		if b.lastSeen().Before(cutoff) {
+			delete(s.limiters, k)
+		}
+	}
+	// If pure-idle eviction freed nothing, drop a slice of arbitrary keys to
+	// bound the worst case. Map iteration order is randomized, so this is a
+	// random-eviction policy under sustained adversarial growth.
+	if len(s.limiters) >= s.maxKeys {
+		toDrop := s.maxKeys / 10
+		if toDrop < 1 {
+			toDrop = 1
+		}
+		for k := range s.limiters {
+			if toDrop == 0 {
+				break
+			}
+			delete(s.limiters, k)
+			toDrop--
+		}
+	}
+}
+
+// defaultKeyFunc returns the client IP from r.RemoteAddr. It does NOT trust
+// any forwarded-for header; spoofed XFF would let any client bypass the
+// rate limit. Use XForwardedForKeyFunc to opt in behind trusted proxies.
+func defaultKeyFunc(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// RemoteAddr may be unset in tests, or already host-only.
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// XForwardedForKeyFunc returns a KeyFunc that honors X-Forwarded-For only
+// when the immediate peer is in trustedProxies. It walks XFF right-to-left,
+// skipping every hop that is itself a trusted proxy, and returns the first
+// non-trusted address. If the peer is not trusted, falls back to the peer.
+//
+// trustedProxies are CIDRs (e.g. "10.0.0.0/8", "::1/128").
+func XForwardedForKeyFunc(trustedProxies []string) (func(r *http.Request) string, error) {
+	prefixes := make([]netip.Prefix, 0, len(trustedProxies))
+	for _, cidr := range trustedProxies {
+		p, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("surf: invalid trusted proxy CIDR %q: %w", cidr, err)
+		}
+		prefixes = append(prefixes, p)
+	}
+
+	isTrusted := func(host string) bool {
+		addr, err := netip.ParseAddr(host)
+		if err != nil {
+			return false
+		}
+		for _, p := range prefixes {
+			if p.Contains(addr) {
+				return true
+			}
+		}
+		return false
+	}
+
+	return func(r *http.Request) string {
+		peer := defaultKeyFunc(r)
+		if !isTrusted(peer) {
+			return peer
+		}
+		xff := r.Header.Get("X-Forwarded-For")
+		if xff == "" {
+			return peer
+		}
+		// Walk right-to-left; the rightmost non-trusted hop is the real client.
+		hops := strings.Split(xff, ",")
+		for i := len(hops) - 1; i >= 0; i-- {
+			h := strings.TrimSpace(hops[i])
+			if h == "" {
+				continue
+			}
+			if !isTrusted(h) {
+				return h
+			}
+		}
+		return peer
+	}, nil
+}
+
+// DefaultRateLimitConfig returns a default rate limit configuration.
+// The default KeyFunc uses the connection peer IP only and does not trust
+// any forwarded-for header.
 func DefaultRateLimitConfig() RateLimitConfig {
 	return RateLimitConfig{
 		RequestsPerSecond: 10,
 		Burst:             20,
-		KeyFunc: func(r *http.Request) string {
-			// Extract IP from RemoteAddr or X-Forwarded-For
-			if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-				parts := strings.Split(xff, ",")
-				return strings.TrimSpace(parts[0])
-			}
-			// Remove port from RemoteAddr
-			addr := r.RemoteAddr
-			if idx := strings.LastIndex(addr, ":"); idx != -1 {
-				addr = addr[:idx]
-			}
-			return addr
-		},
+		KeyFunc:           defaultKeyFunc,
+		MaxKeys:           100_000,
+		IdleEvictAfter:    10 * time.Minute,
 	}
 }
 
 // RateLimit creates a rate limiting middleware with the given configuration
 func RateLimit(config RateLimitConfig) Middleware {
 	if config.KeyFunc == nil {
-		config.KeyFunc = DefaultRateLimitConfig().KeyFunc
+		config.KeyFunc = defaultKeyFunc
 	}
 	if config.RequestsPerSecond <= 0 {
 		config.RequestsPerSecond = 10
@@ -337,12 +447,17 @@ func RateLimit(config RateLimitConfig) Middleware {
 	if config.Burst <= 0 {
 		config.Burst = int(config.RequestsPerSecond * 2)
 	}
+	if config.MaxKeys <= 0 {
+		config.MaxKeys = 100_000
+	}
+	if config.IdleEvictAfter <= 0 {
+		config.IdleEvictAfter = 10 * time.Minute
+	}
 
-	store := newRateLimiterStore(config.RequestsPerSecond, config.Burst)
+	store := newRateLimiterStore(config.RequestsPerSecond, config.Burst, config.MaxKeys, config.IdleEvictAfter)
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Check if request should skip rate limiting
 			if config.SkipFunc != nil && config.SkipFunc(r) {
 				next.ServeHTTP(w, r)
 				return
