@@ -98,6 +98,82 @@ func TestCORSSpecificOrigins(t *testing.T) {
 	})
 }
 
+func TestCORSEmptyOriginsFailsClosed(t *testing.T) {
+	app := NewApp()
+	app.Use(CORS(CORSConfig{
+		AllowOrigins: []string{},
+		AllowMethods: []string{"GET"},
+	}))
+	app.Get("/test", func(w http.ResponseWriter, r *http.Request) error {
+		w.Write([]byte("ok"))
+		return nil
+	})
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Origin", "http://example.com")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("expected no CORS headers with empty AllowOrigins, got %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+}
+
+func TestCORSWildcardWithCredentialsPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic when combining AllowOrigins=\"*\" with AllowCredentials=true")
+		}
+	}()
+	CORS(CORSConfig{
+		AllowOrigins:     []string{"*"},
+		AllowCredentials: true,
+	})
+}
+
+func TestCORSVaryOnAllowlistMatch(t *testing.T) {
+	app := NewApp()
+	app.Use(CORS(CORSConfig{
+		AllowOrigins: []string{"http://allowed.com"},
+		AllowMethods: []string{"GET"},
+	}))
+	app.Get("/test", func(w http.ResponseWriter, r *http.Request) error {
+		w.Write([]byte("ok"))
+		return nil
+	})
+
+	req := httptest.NewRequest("GET", "/test", nil)
+	req.Header.Set("Origin", "http://allowed.com")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	vary := rec.Header().Get("Vary")
+	if !strings.Contains(vary, "Origin") {
+		t.Errorf("expected Vary to include Origin, got %q", vary)
+	}
+}
+
+func TestCORSEmptyOriginHeaderNotEchoed(t *testing.T) {
+	app := NewApp()
+	app.Use(CORS(CORSConfig{
+		AllowOrigins: []string{"http://allowed.com"},
+		AllowMethods: []string{"GET"},
+	}))
+	app.Get("/test", func(w http.ResponseWriter, r *http.Request) error {
+		w.Write([]byte("ok"))
+		return nil
+	})
+
+	// Request without Origin header should not get any CORS response headers.
+	req := httptest.NewRequest("GET", "/test", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Error("missing Origin header should not produce ACAO header")
+	}
+}
+
 func TestRecoveryMiddleware(t *testing.T) {
 	app := NewApp()
 	app.Use(RecoveryWithDefaults())

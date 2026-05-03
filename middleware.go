@@ -34,7 +34,8 @@ type CORSConfig struct {
 	MaxAge int
 }
 
-// DefaultCORSConfig returns a permissive CORS configuration
+// DefaultCORSConfig returns a permissive CORS configuration that allows any
+// origin without credentials. Override AllowOrigins explicitly for production.
 func DefaultCORSConfig() CORSConfig {
 	return CORSConfig{
 		AllowOrigins: []string{"*"},
@@ -44,26 +45,53 @@ func DefaultCORSConfig() CORSConfig {
 	}
 }
 
-// CORS creates a CORS middleware with the given configuration
+// CORS creates a CORS middleware with the given configuration.
+//
+// Behavior:
+//   - Empty AllowOrigins is fail-closed: no CORS headers are emitted, so
+//     browsers reject cross-origin requests. Set AllowOrigins explicitly.
+//   - AllowOrigins{"*"} combined with AllowCredentials=true panics at
+//     construction. Browsers reject this combination, but a non-browser
+//     client could be misled. Use an explicit allowlist with credentials.
+//   - When the request Origin matches an allowlist entry, the response
+//     echoes that origin and adds Vary: Origin so caches don't conflate
+//     cross-origin clients.
 func CORS(config CORSConfig) Middleware {
+	if config.AllowCredentials {
+		for _, o := range config.AllowOrigins {
+			if o == "*" {
+				panic("surf: CORS AllowOrigins=\"*\" with AllowCredentials=true is unsafe and rejected by browsers; use an explicit origin allowlist")
+			}
+		}
+	}
+
 	allowMethods := strings.Join(config.AllowMethods, ", ")
 	allowHeaders := strings.Join(config.AllowHeaders, ", ")
 	exposeHeaders := strings.Join(config.ExposeHeaders, ", ")
+
+	wildcard := len(config.AllowOrigins) == 1 && config.AllowOrigins[0] == "*"
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			origin := r.Header.Get("Origin")
 
-			// Check if origin is allowed
+			// Empty allowlist: fail-closed. No CORS headers.
+			if len(config.AllowOrigins) == 0 {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			allowed := false
-			if len(config.AllowOrigins) == 0 || (len(config.AllowOrigins) == 1 && config.AllowOrigins[0] == "*") {
+			switch {
+			case wildcard:
 				allowed = true
 				w.Header().Set("Access-Control-Allow-Origin", "*")
-			} else {
+			default:
 				for _, o := range config.AllowOrigins {
-					if o == origin {
+					if o == origin && origin != "" {
 						allowed = true
 						w.Header().Set("Access-Control-Allow-Origin", origin)
+						w.Header().Add("Vary", "Origin")
 						break
 					}
 				}
@@ -74,7 +102,6 @@ func CORS(config CORSConfig) Middleware {
 				return
 			}
 
-			// Set CORS headers
 			if allowMethods != "" {
 				w.Header().Set("Access-Control-Allow-Methods", allowMethods)
 			}
@@ -91,7 +118,6 @@ func CORS(config CORSConfig) Middleware {
 				w.Header().Set("Access-Control-Max-Age", fmt.Sprintf("%d", config.MaxAge))
 			}
 
-			// Handle preflight request
 			if r.Method == http.MethodOptions {
 				w.WriteHeader(http.StatusNoContent)
 				return
