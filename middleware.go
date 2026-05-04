@@ -1,8 +1,10 @@
 package surf
 
 import (
+	"bufio"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -644,7 +646,18 @@ func DefaultGzipConfig() GzipConfig {
 	}
 }
 
-// Gzip creates a gzip compression middleware with the given configuration
+// Gzip creates a gzip compression middleware with the given configuration.
+//
+// Implementation: the middleware buffers up to MinSize bytes for content-type
+// sniffing and the size threshold check, then commits to either streaming
+// through gzip.Writer or passing through uncompressed. Bytes after that
+// flow directly without further buffering, so streaming endpoints (SSE,
+// NDJSON) work as long as MinSize is small enough to commit promptly. Call
+// Flush from the handler to force a commit before MinSize is reached.
+//
+// Hijack is supported only when called before any Write — required for
+// WebSocket handshakes. After any data has been buffered or written,
+// Hijack returns an error; opt out via SkipFunc for those endpoints.
 func Gzip(config GzipConfig) Middleware {
 	if config.Level == 0 {
 		config.Level = gzip.DefaultCompression
@@ -652,17 +665,18 @@ func Gzip(config GzipConfig) Middleware {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Check if client accepts gzip
 			if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 				next.ServeHTTP(w, r)
 				return
 			}
-
-			// Check if we should skip
 			if config.SkipFunc != nil && config.SkipFunc(r) {
 				next.ServeHTTP(w, r)
 				return
 			}
+
+			// Vary applies whether or not we end up compressing — caches
+			// must key on Accept-Encoding.
+			w.Header().Add("Vary", "Accept-Encoding")
 
 			gz := &gzipResponseWriter{
 				ResponseWriter: w,
@@ -670,74 +684,166 @@ func Gzip(config GzipConfig) Middleware {
 			}
 			defer gz.Close()
 
-			// Set Vary header
-			w.Header().Set("Vary", "Accept-Encoding")
-
 			next.ServeHTTP(gz, r)
 		})
 	}
 }
 
-// gzipResponseWriter wraps http.ResponseWriter with gzip compression
+// gzipResponseWriter compresses responses via a small sniff buffer and a
+// streaming gzip.Writer. The state machine has three phases:
+//
+//   buffering  — collecting bytes up to MinSize so we can decide whether
+//                to compress (and sniff Content-Type if not provided).
+//   compressing — committed; bytes flow through gzip.Writer to the wire.
+//   passthrough — committed; bytes flow directly to the wire uncompressed.
+//
+// commit() performs the buffering→committed transition exactly once.
 type gzipResponseWriter struct {
 	http.ResponseWriter
-	writer     *gzip.Writer
-	config     GzipConfig
-	buf        []byte
-	statusCode int
-	headerSent bool
+	config GzipConfig
+
+	statusCode  int
+	wroteHeader bool
+
+	buf []byte // sniff/threshold buffer; nil after commit
+
+	committed   bool
+	compressing bool
+	gzipWriter  *gzip.Writer
 }
 
 func (gz *gzipResponseWriter) WriteHeader(code int) {
+	if gz.wroteHeader {
+		return
+	}
+	gz.wroteHeader = true
 	gz.statusCode = code
 }
 
 func (gz *gzipResponseWriter) Write(b []byte) (int, error) {
-	gz.buf = append(gz.buf, b...)
-	return len(b), nil
+	if !gz.committed {
+		gz.buf = append(gz.buf, b...)
+		if len(gz.buf) >= gz.config.MinSize {
+			if err := gz.commit(); err != nil {
+				return 0, err
+			}
+		}
+		return len(b), nil
+	}
+	if gz.compressing {
+		return gz.gzipWriter.Write(b)
+	}
+	return gz.ResponseWriter.Write(b)
 }
 
-func (gz *gzipResponseWriter) Close() error {
-	// Check content type
+// commit decides compress vs passthrough, writes the response status, and
+// flushes any buffered bytes to the chosen path. Called exactly once per
+// response, either by Write reaching MinSize, by Flush, or by Close.
+func (gz *gzipResponseWriter) commit() error {
+	if gz.committed {
+		return nil
+	}
+	gz.committed = true
+
 	contentType := gz.Header().Get("Content-Type")
 	if contentType == "" {
 		contentType = http.DetectContentType(gz.buf)
+		gz.Header().Set("Content-Type", contentType)
 	}
 
-	shouldCompress := len(gz.buf) >= gz.config.MinSize
-	if shouldCompress && len(gz.config.ContentTypes) > 0 {
-		shouldCompress = false
-		for _, ct := range gz.config.ContentTypes {
-			if strings.HasPrefix(contentType, ct) {
-				shouldCompress = true
-				break
+	if gz.shouldCompress(contentType) {
+		gz.compressing = true
+		gz.Header().Set("Content-Encoding", "gzip")
+		// Original Content-Length is wrong post-compression and the
+		// stdlib server will recompute or chunk-encode without it.
+		gz.Header().Del("Content-Length")
+	}
+
+	if gz.statusCode == 0 {
+		gz.statusCode = http.StatusOK
+	}
+	gz.ResponseWriter.WriteHeader(gz.statusCode)
+
+	if !gz.compressing {
+		if len(gz.buf) > 0 {
+			if _, err := gz.ResponseWriter.Write(gz.buf); err != nil {
+				return err
 			}
 		}
+		gz.buf = nil
+		return nil
 	}
 
-	if shouldCompress {
-		gz.Header().Set("Content-Encoding", "gzip")
-		gz.Header().Del("Content-Length")
-
-		if gz.statusCode != 0 {
-			gz.ResponseWriter.WriteHeader(gz.statusCode)
-		}
-
-		writer, err := gzip.NewWriterLevel(gz.ResponseWriter, gz.config.Level)
-		if err != nil {
-			return err
-		}
-		defer writer.Close()
-		_, err = writer.Write(gz.buf)
+	gw, err := gzip.NewWriterLevel(gz.ResponseWriter, gz.config.Level)
+	if err != nil {
 		return err
 	}
-
-	// Write uncompressed
-	if gz.statusCode != 0 {
-		gz.ResponseWriter.WriteHeader(gz.statusCode)
+	gz.gzipWriter = gw
+	if len(gz.buf) > 0 {
+		if _, err := gw.Write(gz.buf); err != nil {
+			return err
+		}
 	}
-	_, err := gz.ResponseWriter.Write(gz.buf)
-	return err
+	gz.buf = nil
+	return nil
+}
+
+func (gz *gzipResponseWriter) shouldCompress(contentType string) bool {
+	if len(gz.buf) < gz.config.MinSize {
+		return false
+	}
+	if len(gz.config.ContentTypes) == 0 {
+		return true
+	}
+	for _, ct := range gz.config.ContentTypes {
+		if strings.HasPrefix(contentType, ct) {
+			return true
+		}
+	}
+	return false
+}
+
+// Flush forces commit (so buffered bytes reach the wire), flushes the gzip
+// layer if compressing, and flushes the underlying writer.
+func (gz *gzipResponseWriter) Flush() {
+	if !gz.committed {
+		_ = gz.commit()
+	}
+	if gz.gzipWriter != nil {
+		_ = gz.gzipWriter.Flush()
+	}
+	if f, ok := gz.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack is permitted only before any Write or WriteHeader. The compression
+// state would otherwise be inconsistent with what the caller writes
+// directly to the conn.
+func (gz *gzipResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := gz.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("surf: underlying ResponseWriter does not support hijacking")
+	}
+	if gz.committed || gz.wroteHeader || len(gz.buf) > 0 {
+		return nil, nil, errors.New("surf: cannot hijack after writing through gzip middleware; use SkipFunc for hijacked endpoints")
+	}
+	// Mark committed so any later Write would return through passthrough,
+	// though after a successful hijack the caller owns the conn.
+	gz.committed = true
+	return hijacker.Hijack()
+}
+
+func (gz *gzipResponseWriter) Close() error {
+	if !gz.committed {
+		if err := gz.commit(); err != nil {
+			return err
+		}
+	}
+	if gz.gzipWriter != nil {
+		return gz.gzipWriter.Close()
+	}
+	return nil
 }
 
 // GzipWithDefaults creates a gzip compression middleware with default configuration
