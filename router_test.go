@@ -364,6 +364,23 @@ func TestAllHTTPMethods(t *testing.T) {
 	}
 }
 
+func TestRouterMethodCaseInsensitiveLookup(t *testing.T) {
+	app := NewApp()
+	app.Get("/x", func(w http.ResponseWriter, r *http.Request) error {
+		w.Write([]byte("ok"))
+		return nil
+	})
+
+	for _, m := range []string{"GET", "get", "Get", "gEt"} {
+		req := httptest.NewRequest(m, "/x", nil)
+		rec := httptest.NewRecorder()
+		app.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("method %q: status = %d, want 200", m, rec.Code)
+		}
+	}
+}
+
 func TestHandleErrorAfterCommittedHeadersPreservesResponse(t *testing.T) {
 	app := NewApp()
 	app.Get("/partial", func(w http.ResponseWriter, r *http.Request) error {

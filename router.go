@@ -66,6 +66,18 @@ func NewRouter() *Router {
 	}
 }
 
+// canonicalMethod returns method in canonical (uppercase) form. It avoids
+// allocation for already-uppercase strings, which is the common case — the
+// fast path is a byte loop with no heap traffic. Hot path on every request.
+func canonicalMethod(m string) string {
+	for i := 0; i < len(m); i++ {
+		if m[i] >= 'a' && m[i] <= 'z' {
+			return strings.ToUpper(m)
+		}
+	}
+	return m
+}
+
 // view returns the routing trees, freezing them on first call. The returned
 // map must be treated as read-only — addRoute will panic before mutating it.
 func (r *Router) view() map[string]*radixTree {
@@ -97,6 +109,7 @@ func (r *Router) getAllowedMethods(path string) []string {
 // the lock, checks the freeze flag, and panics if registration is happening
 // after the first request.
 func (r *Router) insertRoute(method, pattern string, rt *route) {
+	method = canonicalMethod(method)
 	if r.frozen.Load() != nil {
 		panic(fmt.Sprintf("surf: cannot register route after first request (%s %s)", method, pattern))
 	}
@@ -330,7 +343,8 @@ func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
 
 	// Use radix tree for O(log n) route matching. view() freezes the
 	// routing tables on first call so further reads are lock-free.
-	if tree, ok := app.router.view()[r.Method]; ok {
+	method := canonicalMethod(r.Method)
+	if tree, ok := app.router.view()[method]; ok {
 		if route, params := tree.search(r.URL.Path); route != nil {
 			ctx := r.Context()
 			for key, value := range params {
