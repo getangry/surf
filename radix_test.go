@@ -251,40 +251,20 @@ func BenchmarkRadixTreeSearch(b *testing.B) {
 	}
 }
 
-func BenchmarkRadixVsLinear(b *testing.B) {
-	// Create 100 routes
+func BenchmarkRadixSearchManyRoutes(b *testing.B) {
+	// Create 100 routes and benchmark a single search against the middle one.
 	routes := make([]string, 100)
 	for i := 0; i < 100; i++ {
 		routes[i] = "/api/v1/resource" + string(rune('a'+i%26)) + "/" + string(rune('0'+i%10))
 	}
 
-	b.Run("Radix", func(b *testing.B) {
-		tree := newRadixTree()
-		for _, pattern := range routes {
-			tree.insert(pattern, &route{pattern: pattern})
-		}
+	tree := newRadixTree()
+	for _, pattern := range routes {
+		tree.insert(pattern, &route{pattern: pattern})
+	}
 
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			tree.search(routes[50]) // Search middle route
-		}
-	})
-
-	b.Run("Linear", func(b *testing.B) {
-		routeMap := make(map[string]*route)
-		for _, pattern := range routes {
-			routeMap[pattern] = &route{pattern: pattern}
-		}
-
-		b.ResetTimer()
-		for i := 0; i < b.N; i++ {
-			// Simulate linear search
-			for pattern, r := range routeMap {
-				if _, ok := matchPath(pattern, routes[50]); ok {
-					_ = r
-					break
-				}
-			}
-		}
-	})
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		tree.search(routes[50])
+	}
 }

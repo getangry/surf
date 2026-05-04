@@ -45,7 +45,6 @@ type Group struct {
 type route struct {
 	pattern string
 	handler HandlerFunc
-	params  []string
 	before  []HandlerFunc
 	after   []HandlerFunc
 }
@@ -87,11 +86,9 @@ func (r *Router) addRoute(method, pattern string, handler HandlerFunc) {
 		)
 	}
 
-	params := extractParams(pattern)
 	rt := &route{
 		pattern: pattern,
 		handler: handler,
-		params:  params,
 	}
 	r.routes[method][pattern] = rt
 	r.trees[method].insert(pattern, rt)
@@ -236,11 +233,9 @@ func (g *Group) addRoute(method, pattern string, handler HandlerFunc) {
 		g.app.router.trees[method] = newRadixTree()
 	}
 
-	params := extractParams(fullPattern)
 	rt := &route{
 		pattern: fullPattern,
 		handler: handler,
-		params:  params,
 		before:  append([]HandlerFunc{}, g.before...),
 		after:   append([]HandlerFunc{}, g.after...),
 	}
@@ -373,78 +368,3 @@ func Param(r *http.Request, key string) string {
 	return str
 }
 
-// extractParams extracts parameter names from a route pattern
-func extractParams(pattern string) []string {
-	var params []string
-	parts := strings.Split(pattern, "/")
-	for _, part := range parts {
-		if strings.HasPrefix(part, ":") {
-			params = append(params, strings.TrimPrefix(part, ":"))
-		}
-	}
-	return params
-}
-
-// matchPath checks if a path matches a pattern and extracts parameters
-func matchPath(pattern, path string) (map[string]string, bool) {
-	patternParts := strings.Split(pattern, "/")
-	pathParts := strings.Split(path, "/")
-
-	if strings.Contains(pattern, "*") {
-		wildcardIndex := -1
-		for i, part := range patternParts {
-			if part == "*" {
-				wildcardIndex = i
-				break
-			}
-		}
-
-		if wildcardIndex != -1 {
-			if wildcardIndex > len(pathParts) {
-				return nil, false
-			}
-			for i := 0; i < wildcardIndex; i++ {
-				if i >= len(pathParts) {
-					return nil, false
-				}
-				if !strings.HasPrefix(patternParts[i], ":") && patternParts[i] != pathParts[i] {
-					return nil, false
-				}
-			}
-
-			// Extract parameters before wildcard
-			params := make(map[string]string)
-			for i := 0; i < wildcardIndex && i < len(pathParts); i++ {
-				if strings.HasPrefix(patternParts[i], ":") {
-					paramName := strings.TrimPrefix(patternParts[i], ":")
-					params[paramName] = pathParts[i]
-				}
-			}
-
-			// Wildcard matches the rest
-			if wildcardIndex < len(pathParts) {
-				params["*"] = strings.Join(pathParts[wildcardIndex:], "/")
-			}
-			return params, true
-		}
-	}
-
-	// Regular pattern matching
-	if len(patternParts) != len(pathParts) {
-		return nil, false
-	}
-
-	params := make(map[string]string)
-	for i, patternPart := range patternParts {
-		if strings.HasPrefix(patternPart, ":") {
-			// This is a parameter
-			paramName := strings.TrimPrefix(patternPart, ":")
-			params[paramName] = pathParts[i]
-		} else if patternPart != pathParts[i] {
-			// Static part doesn't match
-			return nil, false
-		}
-	}
-
-	return params, true
-}

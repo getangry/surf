@@ -298,65 +298,6 @@ func TestRouterHandlerError(t *testing.T) {
 	}
 }
 
-func TestMatchPath(t *testing.T) {
-	tests := []struct {
-		name    string
-		pattern string
-		path    string
-		match   bool
-		params  map[string]string
-	}{
-		{"exact match", "/users", "/users", true, map[string]string{}},
-		{"no match", "/users", "/posts", false, nil},
-		{"single param", "/users/:id", "/users/123", true, map[string]string{"id": "123"}},
-		{"multiple params", "/users/:id/posts/:postId", "/users/1/posts/2", true, map[string]string{"id": "1", "postId": "2"}},
-		{"wildcard", "/static/*", "/static/css/style.css", true, map[string]string{"*": "css/style.css"}},
-		{"length mismatch", "/users/:id", "/users", false, nil},
-		{"trailing slash mismatch", "/users", "/users/", false, nil},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			params, ok := matchPath(tt.pattern, tt.path)
-			if ok != tt.match {
-				t.Errorf("match = %v, want %v", ok, tt.match)
-			}
-			if tt.match {
-				for k, v := range tt.params {
-					if params[k] != v {
-						t.Errorf("params[%q] = %q, want %q", k, params[k], v)
-					}
-				}
-			}
-		})
-	}
-}
-
-func TestExtractParams(t *testing.T) {
-	tests := []struct {
-		pattern string
-		want    []string
-	}{
-		{"/users", nil},
-		{"/users/:id", []string{"id"}},
-		{"/users/:id/posts/:postId", []string{"id", "postId"}},
-		{"/:a/:b/:c", []string{"a", "b", "c"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.pattern, func(t *testing.T) {
-			got := extractParams(tt.pattern)
-			if len(got) != len(tt.want) {
-				t.Fatalf("len = %d, want %d", len(got), len(tt.want))
-			}
-			for i, v := range tt.want {
-				if got[i] != v {
-					t.Errorf("params[%d] = %q, want %q", i, got[i], v)
-				}
-			}
-		})
-	}
-}
 
 func TestParamMissingKey(t *testing.T) {
 	app := NewApp()
