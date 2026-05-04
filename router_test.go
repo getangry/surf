@@ -37,7 +37,7 @@ func TestRouterBasicRoutes(t *testing.T) {
 		{"GET users", "GET", "/users", http.StatusOK, "users"},
 		{"POST users", "POST", "/users", http.StatusCreated, "created"},
 		{"GET not found", "GET", "/notfound", http.StatusNotFound, "404 page not found\n"},
-		{"wrong method", "DELETE", "/users", http.StatusNotFound, "404 page not found\n"},
+		{"wrong method", "DELETE", "/users", http.StatusMethodNotAllowed, "Method Not Allowed\n"},
 	}
 
 	for _, tt := range tests {
