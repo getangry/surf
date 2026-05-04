@@ -503,7 +503,17 @@ func DefaultTimeoutConfig() TimeoutConfig {
 	}
 }
 
-// Timeout creates a timeout middleware with the given configuration
+// Timeout creates a timeout middleware with the given configuration.
+//
+// Caveats:
+//   - The middleware buffers the response in memory and writes it only when
+//     the handler returns. Streaming endpoints (SSE, NDJSON, large file
+//     downloads) will appear unresponsive to clients; do not wrap them.
+//   - When the timeout fires, the handler goroutine is not killed — Go has
+//     no safe way to do that. The request context is cancelled, so handlers
+//     must observe r.Context().Done() to release resources promptly.
+//     Otherwise the goroutine continues until the handler returns naturally,
+//     producing a bounded (but real) goroutine leak under sustained timeouts.
 func Timeout(config TimeoutConfig) Middleware {
 	if config.Timeout <= 0 {
 		config.Timeout = 30 * time.Second
@@ -529,21 +539,18 @@ func Timeout(config TimeoutConfig) Middleware {
 
 			select {
 			case <-done:
-				// Request completed successfully
-				tw.mu.Lock()
-				defer tw.mu.Unlock()
-				if !tw.timedOut {
-					// Copy headers
-					for k, v := range tw.h {
-						w.Header()[k] = v
-					}
-					if tw.code != 0 {
-						w.WriteHeader(tw.code)
-					}
-					w.Write(tw.buf)
+				// Handler returned. close(done) happens-before this receive,
+				// so reads of tw fields are safe without re-locking.
+				for k, v := range tw.h {
+					w.Header()[k] = v
 				}
+				if tw.code != 0 {
+					w.WriteHeader(tw.code)
+				}
+				w.Write(tw.buf)
 			case <-ctx.Done():
-				// Request timed out
+				// Mark timed-out under lock so any in-flight handler Write
+				// returns http.ErrHandlerTimeout and the handler can unwind.
 				tw.mu.Lock()
 				tw.timedOut = true
 				tw.mu.Unlock()
@@ -558,7 +565,10 @@ func Timeout(config TimeoutConfig) Middleware {
 	}
 }
 
-// timeoutWriter buffers the response until we know if we timed out
+// timeoutWriter buffers the response until we know if we timed out.
+// It does not implement http.Hijacker: hijacking would defeat the buffering
+// strategy the timeout depends on. Flush is a deliberate no-op for the
+// same reason — bytes do not reach the wire until the handler returns.
 type timeoutWriter struct {
 	http.ResponseWriter
 	h        http.Header
@@ -576,7 +586,7 @@ func (tw *timeoutWriter) Write(b []byte) (int, error) {
 	tw.mu.Lock()
 	defer tw.mu.Unlock()
 	if tw.timedOut {
-		return 0, context.DeadlineExceeded
+		return 0, http.ErrHandlerTimeout
 	}
 	tw.buf = append(tw.buf, b...)
 	return len(b), nil
@@ -590,6 +600,10 @@ func (tw *timeoutWriter) WriteHeader(code int) {
 	}
 	tw.code = code
 }
+
+// Flush is a no-op. The timeout middleware buffers the entire response
+// until the handler returns, so flushing has no effect.
+func (tw *timeoutWriter) Flush() {}
 
 // TimeoutWithDefaults creates a timeout middleware with default configuration
 func TimeoutWithDefaults() Middleware {

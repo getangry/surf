@@ -514,6 +514,49 @@ func TestTimeoutMiddleware(t *testing.T) {
 	})
 }
 
+func TestTimeoutHandlerObservesContextCancellation(t *testing.T) {
+	app := NewApp()
+	app.Use(Timeout(TimeoutConfig{Timeout: 30 * time.Millisecond}))
+
+	cancelled := make(chan struct{})
+	app.Get("/respect-ctx", func(w http.ResponseWriter, r *http.Request) error {
+		// Well-behaved handler that observes context cancellation.
+		select {
+		case <-r.Context().Done():
+			close(cancelled)
+		case <-time.After(500 * time.Millisecond):
+		}
+		return nil
+	})
+
+	req := httptest.NewRequest("GET", "/respect-ctx", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusGatewayTimeout {
+		t.Errorf("status = %d, want 504", rec.Code)
+	}
+	select {
+	case <-cancelled:
+		// good
+	case <-time.After(200 * time.Millisecond):
+		t.Error("handler did not observe context cancellation within 200ms after timeout fired")
+	}
+}
+
+func TestTimeoutWriteAfterTimeoutReturnsHandlerTimeout(t *testing.T) {
+	tw := &timeoutWriter{
+		ResponseWriter: httptest.NewRecorder(),
+		h:              make(http.Header),
+	}
+	tw.timedOut = true
+
+	_, err := tw.Write([]byte("late"))
+	if err != http.ErrHandlerTimeout {
+		t.Errorf("Write after timeout: err = %v, want http.ErrHandlerTimeout", err)
+	}
+}
+
 func TestGzipMiddleware(t *testing.T) {
 	app := NewApp()
 	app.Use(GzipWithDefaults())
