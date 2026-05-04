@@ -66,6 +66,18 @@ func NewRouter() *Router {
 	}
 }
 
+// altTrailingSlash returns the path with its trailing slash toggled.
+// "/" has no alternative — root never redirects to itself.
+func altTrailingSlash(path string) (string, bool) {
+	if path == "/" || path == "" {
+		return "", false
+	}
+	if strings.HasSuffix(path, "/") {
+		return strings.TrimSuffix(path, "/"), true
+	}
+	return path + "/", true
+}
+
 // canonicalMethod returns method in canonical (uppercase) form. It avoids
 // allocation for already-uppercase strings, which is the common case — the
 // fast path is a byte loop with no heap traffic. Hot path on every request.
@@ -345,6 +357,24 @@ func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
 	// routing tables on first call so further reads are lock-free.
 	method := canonicalMethod(r.Method)
 	if tree, ok := app.router.view()[method]; ok {
+		if app.redirectTrailingSlash {
+			if alt, exists := altTrailingSlash(r.URL.Path); exists {
+				if route, _ := tree.search(r.URL.Path); route == nil {
+					if route, _ := tree.search(alt); route != nil {
+						target := alt
+						if r.URL.RawQuery != "" {
+							target += "?" + r.URL.RawQuery
+						}
+						code := http.StatusMovedPermanently
+						if method != http.MethodGet && method != http.MethodHead {
+							code = http.StatusPermanentRedirect
+						}
+						http.Redirect(rw, r, target, code)
+						return
+					}
+				}
+			}
+		}
 		if route, params := tree.search(r.URL.Path); route != nil {
 			ctx := r.Context()
 			for key, value := range params {

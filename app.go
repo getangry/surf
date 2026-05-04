@@ -33,19 +33,20 @@ func DefaultServerConfig() ServerConfig {
 
 // App represents the Surf application with context, logger, and shutdown handling.
 type App struct {
-	ctx              context.Context
-	logger           *slog.Logger
-	cancel           context.CancelFunc
-	shutdown         chan os.Signal
-	services         map[any]any
-	servicesMu       sync.RWMutex
-	router           *Router
-	before           []HandlerFunc
-	after            []HandlerFunc
-	middlewares      []Middleware
-	serverConfig     ServerConfig
-	notFoundHandler  http.HandlerFunc
-	methodNotAllowed http.HandlerFunc
+	ctx                   context.Context
+	logger                *slog.Logger
+	cancel                context.CancelFunc
+	shutdown              chan os.Signal
+	services              map[any]any
+	servicesMu            sync.RWMutex
+	router                *Router
+	before                []HandlerFunc
+	after                 []HandlerFunc
+	middlewares           []Middleware
+	serverConfig          ServerConfig
+	notFoundHandler       http.HandlerFunc
+	methodNotAllowed      http.HandlerFunc
+	redirectTrailingSlash bool
 }
 
 // NewApp initializes a new Surf application instance with context and signal handling.

@@ -364,6 +364,87 @@ func TestAllHTTPMethods(t *testing.T) {
 	}
 }
 
+func TestRedirectTrailingSlashAddsSlash(t *testing.T) {
+	app := NewApp(WithRedirectTrailingSlash())
+	app.Get("/users/", func(w http.ResponseWriter, r *http.Request) error {
+		w.Write([]byte("ok"))
+		return nil
+	})
+
+	req := httptest.NewRequest("GET", "/users", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMovedPermanently {
+		t.Errorf("status = %d, want 301", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/users/" {
+		t.Errorf("Location = %q, want %q", loc, "/users/")
+	}
+}
+
+func TestRedirectTrailingSlashRemovesSlash(t *testing.T) {
+	app := NewApp(WithRedirectTrailingSlash())
+	app.Get("/users", func(w http.ResponseWriter, r *http.Request) error {
+		w.Write([]byte("ok"))
+		return nil
+	})
+
+	req := httptest.NewRequest("GET", "/users/", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMovedPermanently {
+		t.Errorf("status = %d, want 301", rec.Code)
+	}
+}
+
+func TestRedirectTrailingSlashPreservesQueryString(t *testing.T) {
+	app := NewApp(WithRedirectTrailingSlash())
+	app.Get("/users/", func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	})
+
+	req := httptest.NewRequest("GET", "/users?page=2&sort=name", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if loc := rec.Header().Get("Location"); loc != "/users/?page=2&sort=name" {
+		t.Errorf("Location = %q, want query string preserved", loc)
+	}
+}
+
+func TestRedirectTrailingSlashUses308ForPost(t *testing.T) {
+	app := NewApp(WithRedirectTrailingSlash())
+	app.Post("/items/", func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	})
+
+	req := httptest.NewRequest("POST", "/items", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	// 308 preserves method and body across the redirect; 301 may not.
+	if rec.Code != http.StatusPermanentRedirect {
+		t.Errorf("status = %d, want 308 for POST redirect", rec.Code)
+	}
+}
+
+func TestRedirectTrailingSlashOffByDefault(t *testing.T) {
+	app := NewApp()
+	app.Get("/users/", func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	})
+
+	req := httptest.NewRequest("GET", "/users", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (no redirect when option not set)", rec.Code)
+	}
+}
+
 func TestRouterMethodCaseInsensitiveLookup(t *testing.T) {
 	app := NewApp()
 	app.Get("/x", func(w http.ResponseWriter, r *http.Request) error {
