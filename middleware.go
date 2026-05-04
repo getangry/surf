@@ -1,11 +1,15 @@
 package surf
 
 import (
+	"bufio"
 	"compress/gzip"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"runtime/debug"
 	"strings"
 	"sync"
@@ -34,7 +38,8 @@ type CORSConfig struct {
 	MaxAge int
 }
 
-// DefaultCORSConfig returns a permissive CORS configuration
+// DefaultCORSConfig returns a permissive CORS configuration that allows any
+// origin without credentials. Override AllowOrigins explicitly for production.
 func DefaultCORSConfig() CORSConfig {
 	return CORSConfig{
 		AllowOrigins: []string{"*"},
@@ -44,26 +49,53 @@ func DefaultCORSConfig() CORSConfig {
 	}
 }
 
-// CORS creates a CORS middleware with the given configuration
+// CORS creates a CORS middleware with the given configuration.
+//
+// Behavior:
+//   - Empty AllowOrigins is fail-closed: no CORS headers are emitted, so
+//     browsers reject cross-origin requests. Set AllowOrigins explicitly.
+//   - AllowOrigins{"*"} combined with AllowCredentials=true panics at
+//     construction. Browsers reject this combination, but a non-browser
+//     client could be misled. Use an explicit allowlist with credentials.
+//   - When the request Origin matches an allowlist entry, the response
+//     echoes that origin and adds Vary: Origin so caches don't conflate
+//     cross-origin clients.
 func CORS(config CORSConfig) Middleware {
+	if config.AllowCredentials {
+		for _, o := range config.AllowOrigins {
+			if o == "*" {
+				panic("surf: CORS AllowOrigins=\"*\" with AllowCredentials=true is unsafe and rejected by browsers; use an explicit origin allowlist")
+			}
+		}
+	}
+
 	allowMethods := strings.Join(config.AllowMethods, ", ")
 	allowHeaders := strings.Join(config.AllowHeaders, ", ")
 	exposeHeaders := strings.Join(config.ExposeHeaders, ", ")
+
+	wildcard := len(config.AllowOrigins) == 1 && config.AllowOrigins[0] == "*"
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			origin := r.Header.Get("Origin")
 
-			// Check if origin is allowed
+			// Empty allowlist: fail-closed. No CORS headers.
+			if len(config.AllowOrigins) == 0 {
+				next.ServeHTTP(w, r)
+				return
+			}
+
 			allowed := false
-			if len(config.AllowOrigins) == 0 || (len(config.AllowOrigins) == 1 && config.AllowOrigins[0] == "*") {
+			switch {
+			case wildcard:
 				allowed = true
 				w.Header().Set("Access-Control-Allow-Origin", "*")
-			} else {
+			default:
 				for _, o := range config.AllowOrigins {
-					if o == origin {
+					if o == origin && origin != "" {
 						allowed = true
 						w.Header().Set("Access-Control-Allow-Origin", origin)
+						w.Header().Add("Vary", "Origin")
 						break
 					}
 				}
@@ -74,7 +106,6 @@ func CORS(config CORSConfig) Middleware {
 				return
 			}
 
-			// Set CORS headers
 			if allowMethods != "" {
 				w.Header().Set("Access-Control-Allow-Methods", allowMethods)
 			}
@@ -91,7 +122,6 @@ func CORS(config CORSConfig) Middleware {
 				w.Header().Set("Access-Control-Max-Age", fmt.Sprintf("%d", config.MaxAge))
 			}
 
-			// Handle preflight request
 			if r.Method == http.MethodOptions {
 				w.WriteHeader(http.StatusNoContent)
 				return
@@ -193,7 +223,9 @@ type RateLimitConfig struct {
 	// Burst is the maximum burst size
 	Burst int
 
-	// KeyFunc returns a key to identify the client (default: IP address)
+	// KeyFunc returns a key to identify the client. Default: client IP from
+	// r.RemoteAddr. Forwarded-for headers are NOT trusted by default; use
+	// XForwardedForKeyFunc with an explicit trusted-proxy allowlist.
 	KeyFunc func(r *http.Request) string
 
 	// ExceededHandler is called when the rate limit is exceeded
@@ -202,9 +234,19 @@ type RateLimitConfig struct {
 
 	// SkipFunc returns true if the request should skip rate limiting
 	SkipFunc func(r *http.Request) bool
+
+	// MaxKeys caps the number of distinct client buckets retained. When the
+	// store grows past this, idle buckets (no traffic in IdleEvictAfter)
+	// are evicted opportunistically. Defaults to 100_000 if zero.
+	MaxKeys int
+
+	// IdleEvictAfter is the duration of inactivity after which a bucket is
+	// eligible for eviction. Defaults to 10 minutes if zero.
+	IdleEvictAfter time.Duration
 }
 
-// tokenBucket implements a simple token bucket rate limiter
+// tokenBucket implements a simple token bucket rate limiter.
+// lastUpdate doubles as the last-seen timestamp for eviction.
 type tokenBucket struct {
 	tokens     float64
 	lastUpdate time.Time
@@ -241,19 +283,29 @@ func (tb *tokenBucket) allow() bool {
 	return false
 }
 
-// rateLimiterStore stores rate limiters per client
-type rateLimiterStore struct {
-	limiters map[string]*tokenBucket
-	mu       sync.RWMutex
-	rate     float64
-	burst    int
+func (tb *tokenBucket) lastSeen() time.Time {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	return tb.lastUpdate
 }
 
-func newRateLimiterStore(rate float64, burst int) *rateLimiterStore {
+// rateLimiterStore stores rate limiters per client with bounded growth.
+type rateLimiterStore struct {
+	limiters       map[string]*tokenBucket
+	mu             sync.RWMutex
+	rate           float64
+	burst          int
+	maxKeys        int
+	idleEvictAfter time.Duration
+}
+
+func newRateLimiterStore(rate float64, burst, maxKeys int, idleEvictAfter time.Duration) *rateLimiterStore {
 	return &rateLimiterStore{
-		limiters: make(map[string]*tokenBucket),
-		rate:     rate,
-		burst:    burst,
+		limiters:       make(map[string]*tokenBucket),
+		rate:           rate,
+		burst:          burst,
+		maxKeys:        maxKeys,
+		idleEvictAfter: idleEvictAfter,
 	}
 }
 
@@ -261,7 +313,6 @@ func (s *rateLimiterStore) get(key string) *tokenBucket {
 	s.mu.RLock()
 	limiter, exists := s.limiters[key]
 	s.mu.RUnlock()
-
 	if exists {
 		return limiter
 	}
@@ -269,9 +320,12 @@ func (s *rateLimiterStore) get(key string) *tokenBucket {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	// Double-check after acquiring write lock
 	if limiter, exists = s.limiters[key]; exists {
 		return limiter
+	}
+
+	if len(s.limiters) >= s.maxKeys {
+		s.evictLocked()
 	}
 
 	limiter = newTokenBucket(s.rate, s.burst)
@@ -279,31 +333,115 @@ func (s *rateLimiterStore) get(key string) *tokenBucket {
 	return limiter
 }
 
-// DefaultRateLimitConfig returns a default rate limit configuration
+// evictLocked removes idle buckets. Caller must hold the write lock.
+// If no buckets are idle (high churn), drops the oldest tenth to bound growth.
+func (s *rateLimiterStore) evictLocked() {
+	cutoff := time.Now().Add(-s.idleEvictAfter)
+	for k, b := range s.limiters {
+		if b.lastSeen().Before(cutoff) {
+			delete(s.limiters, k)
+		}
+	}
+	// If pure-idle eviction freed nothing, drop a slice of arbitrary keys to
+	// bound the worst case. Map iteration order is randomized, so this is a
+	// random-eviction policy under sustained adversarial growth.
+	if len(s.limiters) >= s.maxKeys {
+		toDrop := s.maxKeys / 10
+		if toDrop < 1 {
+			toDrop = 1
+		}
+		for k := range s.limiters {
+			if toDrop == 0 {
+				break
+			}
+			delete(s.limiters, k)
+			toDrop--
+		}
+	}
+}
+
+// defaultKeyFunc returns the client IP from r.RemoteAddr. It does NOT trust
+// any forwarded-for header; spoofed XFF would let any client bypass the
+// rate limit. Use XForwardedForKeyFunc to opt in behind trusted proxies.
+func defaultKeyFunc(r *http.Request) string {
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		// RemoteAddr may be unset in tests, or already host-only.
+		return r.RemoteAddr
+	}
+	return host
+}
+
+// XForwardedForKeyFunc returns a KeyFunc that honors X-Forwarded-For only
+// when the immediate peer is in trustedProxies. It walks XFF right-to-left,
+// skipping every hop that is itself a trusted proxy, and returns the first
+// non-trusted address. If the peer is not trusted, falls back to the peer.
+//
+// trustedProxies are CIDRs (e.g. "10.0.0.0/8", "::1/128").
+func XForwardedForKeyFunc(trustedProxies []string) (func(r *http.Request) string, error) {
+	prefixes := make([]netip.Prefix, 0, len(trustedProxies))
+	for _, cidr := range trustedProxies {
+		p, err := netip.ParsePrefix(cidr)
+		if err != nil {
+			return nil, fmt.Errorf("surf: invalid trusted proxy CIDR %q: %w", cidr, err)
+		}
+		prefixes = append(prefixes, p)
+	}
+
+	isTrusted := func(host string) bool {
+		addr, err := netip.ParseAddr(host)
+		if err != nil {
+			return false
+		}
+		for _, p := range prefixes {
+			if p.Contains(addr) {
+				return true
+			}
+		}
+		return false
+	}
+
+	return func(r *http.Request) string {
+		peer := defaultKeyFunc(r)
+		if !isTrusted(peer) {
+			return peer
+		}
+		xff := r.Header.Get("X-Forwarded-For")
+		if xff == "" {
+			return peer
+		}
+		// Walk right-to-left; the rightmost non-trusted hop is the real client.
+		hops := strings.Split(xff, ",")
+		for i := len(hops) - 1; i >= 0; i-- {
+			h := strings.TrimSpace(hops[i])
+			if h == "" {
+				continue
+			}
+			if !isTrusted(h) {
+				return h
+			}
+		}
+		return peer
+	}, nil
+}
+
+// DefaultRateLimitConfig returns a default rate limit configuration.
+// The default KeyFunc uses the connection peer IP only and does not trust
+// any forwarded-for header.
 func DefaultRateLimitConfig() RateLimitConfig {
 	return RateLimitConfig{
 		RequestsPerSecond: 10,
 		Burst:             20,
-		KeyFunc: func(r *http.Request) string {
-			// Extract IP from RemoteAddr or X-Forwarded-For
-			if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-				parts := strings.Split(xff, ",")
-				return strings.TrimSpace(parts[0])
-			}
-			// Remove port from RemoteAddr
-			addr := r.RemoteAddr
-			if idx := strings.LastIndex(addr, ":"); idx != -1 {
-				addr = addr[:idx]
-			}
-			return addr
-		},
+		KeyFunc:           defaultKeyFunc,
+		MaxKeys:           100_000,
+		IdleEvictAfter:    10 * time.Minute,
 	}
 }
 
 // RateLimit creates a rate limiting middleware with the given configuration
 func RateLimit(config RateLimitConfig) Middleware {
 	if config.KeyFunc == nil {
-		config.KeyFunc = DefaultRateLimitConfig().KeyFunc
+		config.KeyFunc = defaultKeyFunc
 	}
 	if config.RequestsPerSecond <= 0 {
 		config.RequestsPerSecond = 10
@@ -311,12 +449,17 @@ func RateLimit(config RateLimitConfig) Middleware {
 	if config.Burst <= 0 {
 		config.Burst = int(config.RequestsPerSecond * 2)
 	}
+	if config.MaxKeys <= 0 {
+		config.MaxKeys = 100_000
+	}
+	if config.IdleEvictAfter <= 0 {
+		config.IdleEvictAfter = 10 * time.Minute
+	}
 
-	store := newRateLimiterStore(config.RequestsPerSecond, config.Burst)
+	store := newRateLimiterStore(config.RequestsPerSecond, config.Burst, config.MaxKeys, config.IdleEvictAfter)
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Check if request should skip rate limiting
 			if config.SkipFunc != nil && config.SkipFunc(r) {
 				next.ServeHTTP(w, r)
 				return
@@ -362,7 +505,17 @@ func DefaultTimeoutConfig() TimeoutConfig {
 	}
 }
 
-// Timeout creates a timeout middleware with the given configuration
+// Timeout creates a timeout middleware with the given configuration.
+//
+// Caveats:
+//   - The middleware buffers the response in memory and writes it only when
+//     the handler returns. Streaming endpoints (SSE, NDJSON, large file
+//     downloads) will appear unresponsive to clients; do not wrap them.
+//   - When the timeout fires, the handler goroutine is not killed — Go has
+//     no safe way to do that. The request context is cancelled, so handlers
+//     must observe r.Context().Done() to release resources promptly.
+//     Otherwise the goroutine continues until the handler returns naturally,
+//     producing a bounded (but real) goroutine leak under sustained timeouts.
 func Timeout(config TimeoutConfig) Middleware {
 	if config.Timeout <= 0 {
 		config.Timeout = 30 * time.Second
@@ -388,21 +541,18 @@ func Timeout(config TimeoutConfig) Middleware {
 
 			select {
 			case <-done:
-				// Request completed successfully
-				tw.mu.Lock()
-				defer tw.mu.Unlock()
-				if !tw.timedOut {
-					// Copy headers
-					for k, v := range tw.h {
-						w.Header()[k] = v
-					}
-					if tw.code != 0 {
-						w.WriteHeader(tw.code)
-					}
-					w.Write(tw.buf)
+				// Handler returned. close(done) happens-before this receive,
+				// so reads of tw fields are safe without re-locking.
+				for k, v := range tw.h {
+					w.Header()[k] = v
 				}
+				if tw.code != 0 {
+					w.WriteHeader(tw.code)
+				}
+				w.Write(tw.buf)
 			case <-ctx.Done():
-				// Request timed out
+				// Mark timed-out under lock so any in-flight handler Write
+				// returns http.ErrHandlerTimeout and the handler can unwind.
 				tw.mu.Lock()
 				tw.timedOut = true
 				tw.mu.Unlock()
@@ -417,7 +567,10 @@ func Timeout(config TimeoutConfig) Middleware {
 	}
 }
 
-// timeoutWriter buffers the response until we know if we timed out
+// timeoutWriter buffers the response until we know if we timed out.
+// It does not implement http.Hijacker: hijacking would defeat the buffering
+// strategy the timeout depends on. Flush is a deliberate no-op for the
+// same reason — bytes do not reach the wire until the handler returns.
 type timeoutWriter struct {
 	http.ResponseWriter
 	h        http.Header
@@ -435,7 +588,7 @@ func (tw *timeoutWriter) Write(b []byte) (int, error) {
 	tw.mu.Lock()
 	defer tw.mu.Unlock()
 	if tw.timedOut {
-		return 0, context.DeadlineExceeded
+		return 0, http.ErrHandlerTimeout
 	}
 	tw.buf = append(tw.buf, b...)
 	return len(b), nil
@@ -449,6 +602,10 @@ func (tw *timeoutWriter) WriteHeader(code int) {
 	}
 	tw.code = code
 }
+
+// Flush is a no-op. The timeout middleware buffers the entire response
+// until the handler returns, so flushing has no effect.
+func (tw *timeoutWriter) Flush() {}
 
 // TimeoutWithDefaults creates a timeout middleware with default configuration
 func TimeoutWithDefaults() Middleware {
@@ -489,7 +646,18 @@ func DefaultGzipConfig() GzipConfig {
 	}
 }
 
-// Gzip creates a gzip compression middleware with the given configuration
+// Gzip creates a gzip compression middleware with the given configuration.
+//
+// Implementation: the middleware buffers up to MinSize bytes for content-type
+// sniffing and the size threshold check, then commits to either streaming
+// through gzip.Writer or passing through uncompressed. Bytes after that
+// flow directly without further buffering, so streaming endpoints (SSE,
+// NDJSON) work as long as MinSize is small enough to commit promptly. Call
+// Flush from the handler to force a commit before MinSize is reached.
+//
+// Hijack is supported only when called before any Write — required for
+// WebSocket handshakes. After any data has been buffered or written,
+// Hijack returns an error; opt out via SkipFunc for those endpoints.
 func Gzip(config GzipConfig) Middleware {
 	if config.Level == 0 {
 		config.Level = gzip.DefaultCompression
@@ -497,17 +665,18 @@ func Gzip(config GzipConfig) Middleware {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Check if client accepts gzip
 			if !strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 				next.ServeHTTP(w, r)
 				return
 			}
-
-			// Check if we should skip
 			if config.SkipFunc != nil && config.SkipFunc(r) {
 				next.ServeHTTP(w, r)
 				return
 			}
+
+			// Vary applies whether or not we end up compressing — caches
+			// must key on Accept-Encoding.
+			w.Header().Add("Vary", "Accept-Encoding")
 
 			gz := &gzipResponseWriter{
 				ResponseWriter: w,
@@ -515,74 +684,166 @@ func Gzip(config GzipConfig) Middleware {
 			}
 			defer gz.Close()
 
-			// Set Vary header
-			w.Header().Set("Vary", "Accept-Encoding")
-
 			next.ServeHTTP(gz, r)
 		})
 	}
 }
 
-// gzipResponseWriter wraps http.ResponseWriter with gzip compression
+// gzipResponseWriter compresses responses via a small sniff buffer and a
+// streaming gzip.Writer. The state machine has three phases:
+//
+//   buffering  — collecting bytes up to MinSize so we can decide whether
+//                to compress (and sniff Content-Type if not provided).
+//   compressing — committed; bytes flow through gzip.Writer to the wire.
+//   passthrough — committed; bytes flow directly to the wire uncompressed.
+//
+// commit() performs the buffering→committed transition exactly once.
 type gzipResponseWriter struct {
 	http.ResponseWriter
-	writer     *gzip.Writer
-	config     GzipConfig
-	buf        []byte
-	statusCode int
-	headerSent bool
+	config GzipConfig
+
+	statusCode  int
+	wroteHeader bool
+
+	buf []byte // sniff/threshold buffer; nil after commit
+
+	committed   bool
+	compressing bool
+	gzipWriter  *gzip.Writer
 }
 
 func (gz *gzipResponseWriter) WriteHeader(code int) {
+	if gz.wroteHeader {
+		return
+	}
+	gz.wroteHeader = true
 	gz.statusCode = code
 }
 
 func (gz *gzipResponseWriter) Write(b []byte) (int, error) {
-	gz.buf = append(gz.buf, b...)
-	return len(b), nil
+	if !gz.committed {
+		gz.buf = append(gz.buf, b...)
+		if len(gz.buf) >= gz.config.MinSize {
+			if err := gz.commit(); err != nil {
+				return 0, err
+			}
+		}
+		return len(b), nil
+	}
+	if gz.compressing {
+		return gz.gzipWriter.Write(b)
+	}
+	return gz.ResponseWriter.Write(b)
 }
 
-func (gz *gzipResponseWriter) Close() error {
-	// Check content type
+// commit decides compress vs passthrough, writes the response status, and
+// flushes any buffered bytes to the chosen path. Called exactly once per
+// response, either by Write reaching MinSize, by Flush, or by Close.
+func (gz *gzipResponseWriter) commit() error {
+	if gz.committed {
+		return nil
+	}
+	gz.committed = true
+
 	contentType := gz.Header().Get("Content-Type")
 	if contentType == "" {
 		contentType = http.DetectContentType(gz.buf)
+		gz.Header().Set("Content-Type", contentType)
 	}
 
-	shouldCompress := len(gz.buf) >= gz.config.MinSize
-	if shouldCompress && len(gz.config.ContentTypes) > 0 {
-		shouldCompress = false
-		for _, ct := range gz.config.ContentTypes {
-			if strings.HasPrefix(contentType, ct) {
-				shouldCompress = true
-				break
+	if gz.shouldCompress(contentType) {
+		gz.compressing = true
+		gz.Header().Set("Content-Encoding", "gzip")
+		// Original Content-Length is wrong post-compression and the
+		// stdlib server will recompute or chunk-encode without it.
+		gz.Header().Del("Content-Length")
+	}
+
+	if gz.statusCode == 0 {
+		gz.statusCode = http.StatusOK
+	}
+	gz.ResponseWriter.WriteHeader(gz.statusCode)
+
+	if !gz.compressing {
+		if len(gz.buf) > 0 {
+			if _, err := gz.ResponseWriter.Write(gz.buf); err != nil {
+				return err
 			}
 		}
+		gz.buf = nil
+		return nil
 	}
 
-	if shouldCompress {
-		gz.Header().Set("Content-Encoding", "gzip")
-		gz.Header().Del("Content-Length")
-
-		if gz.statusCode != 0 {
-			gz.ResponseWriter.WriteHeader(gz.statusCode)
-		}
-
-		writer, err := gzip.NewWriterLevel(gz.ResponseWriter, gz.config.Level)
-		if err != nil {
-			return err
-		}
-		defer writer.Close()
-		_, err = writer.Write(gz.buf)
+	gw, err := gzip.NewWriterLevel(gz.ResponseWriter, gz.config.Level)
+	if err != nil {
 		return err
 	}
-
-	// Write uncompressed
-	if gz.statusCode != 0 {
-		gz.ResponseWriter.WriteHeader(gz.statusCode)
+	gz.gzipWriter = gw
+	if len(gz.buf) > 0 {
+		if _, err := gw.Write(gz.buf); err != nil {
+			return err
+		}
 	}
-	_, err := gz.ResponseWriter.Write(gz.buf)
-	return err
+	gz.buf = nil
+	return nil
+}
+
+func (gz *gzipResponseWriter) shouldCompress(contentType string) bool {
+	if len(gz.buf) < gz.config.MinSize {
+		return false
+	}
+	if len(gz.config.ContentTypes) == 0 {
+		return true
+	}
+	for _, ct := range gz.config.ContentTypes {
+		if strings.HasPrefix(contentType, ct) {
+			return true
+		}
+	}
+	return false
+}
+
+// Flush forces commit (so buffered bytes reach the wire), flushes the gzip
+// layer if compressing, and flushes the underlying writer.
+func (gz *gzipResponseWriter) Flush() {
+	if !gz.committed {
+		_ = gz.commit()
+	}
+	if gz.gzipWriter != nil {
+		_ = gz.gzipWriter.Flush()
+	}
+	if f, ok := gz.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Hijack is permitted only before any Write or WriteHeader. The compression
+// state would otherwise be inconsistent with what the caller writes
+// directly to the conn.
+func (gz *gzipResponseWriter) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := gz.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, errors.New("surf: underlying ResponseWriter does not support hijacking")
+	}
+	if gz.committed || gz.wroteHeader || len(gz.buf) > 0 {
+		return nil, nil, errors.New("surf: cannot hijack after writing through gzip middleware; use SkipFunc for hijacked endpoints")
+	}
+	// Mark committed so any later Write would return through passthrough,
+	// though after a successful hijack the caller owns the conn.
+	gz.committed = true
+	return hijacker.Hijack()
+}
+
+func (gz *gzipResponseWriter) Close() error {
+	if !gz.committed {
+		if err := gz.commit(); err != nil {
+			return err
+		}
+	}
+	if gz.gzipWriter != nil {
+		return gz.gzipWriter.Close()
+	}
+	return nil
 }
 
 // GzipWithDefaults creates a gzip compression middleware with default configuration
