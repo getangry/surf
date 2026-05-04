@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // ErrRouteConflict is returned when a route pattern is already registered
@@ -27,10 +29,17 @@ type Middleware func(next http.Handler) http.Handler
 // MiddlewareFunc is a function that can be converted to Middleware
 type MiddlewareFunc func(w http.ResponseWriter, r *http.Request, next http.HandlerFunc)
 
-// Router handles HTTP routing with path parameters
+// Router handles HTTP routing with path parameters.
+//
+// Lifecycle: routes are registered before the first request. The first
+// request atomically freezes the routing tables into an immutable snapshot
+// served lock-free from then on. Registration after the freeze panics —
+// register all routes during setup, not from inside handlers.
 type Router struct {
-	routes map[string]map[string]*route // Legacy map storage
-	trees  map[string]*radixTree        // Radix trees per method for fast lookup
+	mu     sync.Mutex                              // guards routes/trees during registration
+	routes map[string]map[string]*route            // pattern conflict detection
+	trees  map[string]*radixTree                   // build-time tree per method
+	frozen atomic.Pointer[map[string]*radixTree]   // read-only snapshot for ServeHTTP
 }
 
 // Group represents a route group with a common prefix and middleware
@@ -57,10 +66,26 @@ func NewRouter() *Router {
 	}
 }
 
+// view returns the routing trees, freezing them on first call. The returned
+// map must be treated as read-only — addRoute will panic before mutating it.
+func (r *Router) view() map[string]*radixTree {
+	if t := r.frozen.Load(); t != nil {
+		return *t
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if t := r.frozen.Load(); t != nil {
+		return *t
+	}
+	snap := r.trees
+	r.frozen.Store(&snap)
+	return snap
+}
+
 // getAllowedMethods returns a list of HTTP methods that have routes for the given path
 func (r *Router) getAllowedMethods(path string) []string {
 	var methods []string
-	for method, tree := range r.trees {
+	for method, tree := range r.view() {
 		if route, _ := tree.search(path); route != nil {
 			methods = append(methods, method)
 		}
@@ -68,30 +93,41 @@ func (r *Router) getAllowedMethods(path string) []string {
 	return methods
 }
 
-// addRoute adds a route to the router
-// Logs a warning if the route pattern already exists (will be overwritten)
-func (r *Router) addRoute(method, pattern string, handler HandlerFunc) {
+// insertRoute is the single mutation point for the routing tables. It takes
+// the lock, checks the freeze flag, and panics if registration is happening
+// after the first request.
+func (r *Router) insertRoute(method, pattern string, rt *route) {
+	if r.frozen.Load() != nil {
+		panic(fmt.Sprintf("surf: cannot register route after first request (%s %s)", method, pattern))
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.frozen.Load() != nil {
+		panic(fmt.Sprintf("surf: cannot register route after first request (%s %s)", method, pattern))
+	}
 	if r.routes[method] == nil {
 		r.routes[method] = make(map[string]*route)
 	}
 	if r.trees[method] == nil {
 		r.trees[method] = newRadixTree()
 	}
-
-	// Warn on route conflict (pattern already registered)
 	if _, exists := r.routes[method][pattern]; exists {
 		slog.Warn("route conflict: overwriting existing route",
 			"method", method,
 			"pattern", pattern,
 		)
 	}
-
-	rt := &route{
-		pattern: pattern,
-		handler: handler,
-	}
 	r.routes[method][pattern] = rt
 	r.trees[method].insert(pattern, rt)
+}
+
+// addRoute adds a route to the router.
+// Logs a warning if the route pattern already exists (will be overwritten).
+func (r *Router) addRoute(method, pattern string, handler HandlerFunc) {
+	r.insertRoute(method, pattern, &route{
+		pattern: pattern,
+		handler: handler,
+	})
 }
 
 // Get registers a GET route
@@ -223,24 +259,14 @@ func (g *Group) Options(pattern string, handler HandlerFunc) {
 	g.addRoute("OPTIONS", pattern, handler)
 }
 
-// addRoute adds a route to the group
+// addRoute adds a route to the group, attaching the group's before/after handlers.
 func (g *Group) addRoute(method, pattern string, handler HandlerFunc) {
-	fullPattern := g.prefix + pattern
-	if g.app.router.routes[method] == nil {
-		g.app.router.routes[method] = make(map[string]*route)
-	}
-	if g.app.router.trees[method] == nil {
-		g.app.router.trees[method] = newRadixTree()
-	}
-
-	rt := &route{
-		pattern: fullPattern,
+	g.app.router.insertRoute(method, g.prefix+pattern, &route{
+		pattern: g.prefix + pattern,
 		handler: handler,
 		before:  append([]HandlerFunc{}, g.before...),
 		after:   append([]HandlerFunc{}, g.after...),
-	}
-	g.app.router.routes[method][fullPattern] = rt
-	g.app.router.trees[method].insert(fullPattern, rt)
+	})
 }
 
 // ServeHTTP implements the http.Handler interface
@@ -296,8 +322,9 @@ func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Use radix tree for O(log n) route matching
-	if tree, ok := app.router.trees[r.Method]; ok {
+	// Use radix tree for O(log n) route matching. view() freezes the
+	// routing tables on first call so further reads are lock-free.
+	if tree, ok := app.router.view()[r.Method]; ok {
 		if route, params := tree.search(r.URL.Path); route != nil {
 			ctx := r.Context()
 			for key, value := range params {

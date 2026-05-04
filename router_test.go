@@ -3,6 +3,7 @@ package surf
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 )
 
@@ -361,4 +362,52 @@ func TestAllHTTPMethods(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRouterPanicsOnRegistrationAfterFirstRequest(t *testing.T) {
+	app := NewApp()
+	app.Get("/before", func(w http.ResponseWriter, r *http.Request) error {
+		w.Write([]byte("ok"))
+		return nil
+	})
+
+	// First request freezes the routing tables.
+	app.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/before", nil))
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic on route registration after first request")
+		}
+	}()
+	app.Get("/after", func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	})
+}
+
+func TestRouterConcurrentReadsAfterFreeze(t *testing.T) {
+	// Hot-path lookups must be lock-free and safe under concurrent traffic.
+	// The race detector will flag any unsynchronized access.
+	app := NewApp()
+	for _, p := range []string{"/a", "/b", "/c", "/d", "/e"} {
+		p := p
+		app.Get(p, func(w http.ResponseWriter, r *http.Request) error {
+			w.Write([]byte(p))
+			return nil
+		})
+	}
+
+	const goroutines = 50
+	const requests = 200
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			paths := []string{"/a", "/b", "/c", "/d", "/e", "/missing"}
+			for j := 0; j < requests; j++ {
+				app.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", paths[j%len(paths)], nil))
+			}
+		}()
+	}
+	wg.Wait()
 }
