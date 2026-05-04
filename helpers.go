@@ -1,9 +1,9 @@
 package surf
 
 import (
+	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -113,44 +113,30 @@ func RedirectSeeOther(w http.ResponseWriter, r *http.Request, url string) {
 // Static registers a handler for serving static files from a directory.
 // The prefix is the URL path prefix (e.g., "/static").
 // The dir is the filesystem directory to serve files from.
+//
+// Path traversal is prevented at the kernel level by os.Root: any "..",
+// absolute paths, or symlinks escaping dir return an error from the
+// filesystem before any bytes are served. Panics if dir cannot be opened.
 func (app *App) Static(prefix, dir string) {
-	// Ensure prefix starts with / and doesn't end with /
 	if !strings.HasPrefix(prefix, "/") {
 		prefix = "/" + prefix
 	}
 	prefix = strings.TrimSuffix(prefix, "/")
 
-	// Create file server
-	fs := http.FileServer(http.Dir(dir))
-	handler := http.StripPrefix(prefix, fs)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		panic(fmt.Sprintf("surf: Static(%q, %q): %v", prefix, dir, err))
+	}
 
-	// Register wildcard route
+	handler := http.StripPrefix(prefix, http.FileServerFS(root.FS()))
+
 	app.Get(prefix+"/*", func(w http.ResponseWriter, r *http.Request) error {
-		// Get the file path from wildcard
-		filePath := Param(r, "*")
-
-		// Security: prevent directory traversal
-		if strings.Contains(filePath, "..") {
-			http.NotFound(w, r)
-			return nil
-		}
-
-		// Check if file exists
-		fullPath := filepath.Join(dir, filePath)
-		info, err := os.Stat(fullPath)
-		if err != nil || info.IsDir() {
-			http.NotFound(w, r)
-			return nil
-		}
-
-		// Serve the file
 		handler.ServeHTTP(w, r)
 		return nil
 	})
 
-	// Also handle the prefix without wildcard for root of static dir
+	// Redirect bare prefix to prefix/ so relative links resolve correctly.
 	app.Get(prefix, func(w http.ResponseWriter, r *http.Request) error {
-		// Redirect to prefix/ if needed
 		http.Redirect(w, r, prefix+"/", http.StatusMovedPermanently)
 		return nil
 	})

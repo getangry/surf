@@ -3,6 +3,7 @@ package surf
 import (
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 )
 
@@ -36,7 +37,7 @@ func TestRouterBasicRoutes(t *testing.T) {
 		{"GET users", "GET", "/users", http.StatusOK, "users"},
 		{"POST users", "POST", "/users", http.StatusCreated, "created"},
 		{"GET not found", "GET", "/notfound", http.StatusNotFound, "404 page not found\n"},
-		{"wrong method", "DELETE", "/users", http.StatusNotFound, "404 page not found\n"},
+		{"wrong method", "DELETE", "/users", http.StatusMethodNotAllowed, "Method Not Allowed\n"},
 	}
 
 	for _, tt := range tests {
@@ -298,65 +299,6 @@ func TestRouterHandlerError(t *testing.T) {
 	}
 }
 
-func TestMatchPath(t *testing.T) {
-	tests := []struct {
-		name    string
-		pattern string
-		path    string
-		match   bool
-		params  map[string]string
-	}{
-		{"exact match", "/users", "/users", true, map[string]string{}},
-		{"no match", "/users", "/posts", false, nil},
-		{"single param", "/users/:id", "/users/123", true, map[string]string{"id": "123"}},
-		{"multiple params", "/users/:id/posts/:postId", "/users/1/posts/2", true, map[string]string{"id": "1", "postId": "2"}},
-		{"wildcard", "/static/*", "/static/css/style.css", true, map[string]string{"*": "css/style.css"}},
-		{"length mismatch", "/users/:id", "/users", false, nil},
-		{"trailing slash mismatch", "/users", "/users/", false, nil},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			params, ok := matchPath(tt.pattern, tt.path)
-			if ok != tt.match {
-				t.Errorf("match = %v, want %v", ok, tt.match)
-			}
-			if tt.match {
-				for k, v := range tt.params {
-					if params[k] != v {
-						t.Errorf("params[%q] = %q, want %q", k, params[k], v)
-					}
-				}
-			}
-		})
-	}
-}
-
-func TestExtractParams(t *testing.T) {
-	tests := []struct {
-		pattern string
-		want    []string
-	}{
-		{"/users", nil},
-		{"/users/:id", []string{"id"}},
-		{"/users/:id/posts/:postId", []string{"id", "postId"}},
-		{"/:a/:b/:c", []string{"a", "b", "c"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.pattern, func(t *testing.T) {
-			got := extractParams(tt.pattern)
-			if len(got) != len(tt.want) {
-				t.Fatalf("len = %d, want %d", len(got), len(tt.want))
-			}
-			for i, v := range tt.want {
-				if got[i] != v {
-					t.Errorf("params[%d] = %q, want %q", i, got[i], v)
-				}
-			}
-		})
-	}
-}
 
 func TestParamMissingKey(t *testing.T) {
 	app := NewApp()
@@ -420,4 +362,172 @@ func TestAllHTTPMethods(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRedirectTrailingSlashAddsSlash(t *testing.T) {
+	app := NewApp(WithRedirectTrailingSlash())
+	app.Get("/users/", func(w http.ResponseWriter, r *http.Request) error {
+		w.Write([]byte("ok"))
+		return nil
+	})
+
+	req := httptest.NewRequest("GET", "/users", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMovedPermanently {
+		t.Errorf("status = %d, want 301", rec.Code)
+	}
+	if loc := rec.Header().Get("Location"); loc != "/users/" {
+		t.Errorf("Location = %q, want %q", loc, "/users/")
+	}
+}
+
+func TestRedirectTrailingSlashRemovesSlash(t *testing.T) {
+	app := NewApp(WithRedirectTrailingSlash())
+	app.Get("/users", func(w http.ResponseWriter, r *http.Request) error {
+		w.Write([]byte("ok"))
+		return nil
+	})
+
+	req := httptest.NewRequest("GET", "/users/", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusMovedPermanently {
+		t.Errorf("status = %d, want 301", rec.Code)
+	}
+}
+
+func TestRedirectTrailingSlashPreservesQueryString(t *testing.T) {
+	app := NewApp(WithRedirectTrailingSlash())
+	app.Get("/users/", func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	})
+
+	req := httptest.NewRequest("GET", "/users?page=2&sort=name", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if loc := rec.Header().Get("Location"); loc != "/users/?page=2&sort=name" {
+		t.Errorf("Location = %q, want query string preserved", loc)
+	}
+}
+
+func TestRedirectTrailingSlashUses308ForPost(t *testing.T) {
+	app := NewApp(WithRedirectTrailingSlash())
+	app.Post("/items/", func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	})
+
+	req := httptest.NewRequest("POST", "/items", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	// 308 preserves method and body across the redirect; 301 may not.
+	if rec.Code != http.StatusPermanentRedirect {
+		t.Errorf("status = %d, want 308 for POST redirect", rec.Code)
+	}
+}
+
+func TestRedirectTrailingSlashOffByDefault(t *testing.T) {
+	app := NewApp()
+	app.Get("/users/", func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	})
+
+	req := httptest.NewRequest("GET", "/users", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 (no redirect when option not set)", rec.Code)
+	}
+}
+
+func TestRouterMethodCaseInsensitiveLookup(t *testing.T) {
+	app := NewApp()
+	app.Get("/x", func(w http.ResponseWriter, r *http.Request) error {
+		w.Write([]byte("ok"))
+		return nil
+	})
+
+	for _, m := range []string{"GET", "get", "Get", "gEt"} {
+		req := httptest.NewRequest(m, "/x", nil)
+		rec := httptest.NewRecorder()
+		app.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Errorf("method %q: status = %d, want 200", m, rec.Code)
+		}
+	}
+}
+
+func TestHandleErrorAfterCommittedHeadersPreservesResponse(t *testing.T) {
+	app := NewApp()
+	app.Get("/partial", func(w http.ResponseWriter, r *http.Request) error {
+		// Handler writes a successful response, then errors. The framework
+		// must NOT append "Internal Server Error" or change the status.
+		w.WriteHeader(http.StatusAccepted)
+		w.Write([]byte("partial body"))
+		return http.ErrAbortHandler // any error
+	})
+
+	req := httptest.NewRequest("GET", "/partial", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("status = %d, want %d (handler-committed status preserved)", rec.Code, http.StatusAccepted)
+	}
+	if rec.Body.String() != "partial body" {
+		t.Errorf("body = %q, want %q (no error message appended)", rec.Body.String(), "partial body")
+	}
+}
+
+func TestRouterPanicsOnRegistrationAfterFirstRequest(t *testing.T) {
+	app := NewApp()
+	app.Get("/before", func(w http.ResponseWriter, r *http.Request) error {
+		w.Write([]byte("ok"))
+		return nil
+	})
+
+	// First request freezes the routing tables.
+	app.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/before", nil))
+
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("expected panic on route registration after first request")
+		}
+	}()
+	app.Get("/after", func(w http.ResponseWriter, r *http.Request) error {
+		return nil
+	})
+}
+
+func TestRouterConcurrentReadsAfterFreeze(t *testing.T) {
+	// Hot-path lookups must be lock-free and safe under concurrent traffic.
+	// The race detector will flag any unsynchronized access.
+	app := NewApp()
+	for _, p := range []string{"/a", "/b", "/c", "/d", "/e"} {
+		p := p
+		app.Get(p, func(w http.ResponseWriter, r *http.Request) error {
+			w.Write([]byte(p))
+			return nil
+		})
+	}
+
+	const goroutines = 50
+	const requests = 200
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for i := 0; i < goroutines; i++ {
+		go func() {
+			defer wg.Done()
+			paths := []string{"/a", "/b", "/c", "/d", "/e", "/missing"}
+			for j := 0; j < requests; j++ {
+				app.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", paths[j%len(paths)], nil))
+			}
+		}()
+	}
+	wg.Wait()
 }

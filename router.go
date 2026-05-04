@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
+	"sync/atomic"
 )
 
 // ErrRouteConflict is returned when a route pattern is already registered
@@ -27,10 +29,17 @@ type Middleware func(next http.Handler) http.Handler
 // MiddlewareFunc is a function that can be converted to Middleware
 type MiddlewareFunc func(w http.ResponseWriter, r *http.Request, next http.HandlerFunc)
 
-// Router handles HTTP routing with path parameters
+// Router handles HTTP routing with path parameters.
+//
+// Lifecycle: routes are registered before the first request. The first
+// request atomically freezes the routing tables into an immutable snapshot
+// served lock-free from then on. Registration after the freeze panics —
+// register all routes during setup, not from inside handlers.
 type Router struct {
-	routes map[string]map[string]*route // Legacy map storage
-	trees  map[string]*radixTree        // Radix trees per method for fast lookup
+	mu     sync.Mutex                              // guards routes/trees during registration
+	routes map[string]map[string]*route            // pattern conflict detection
+	trees  map[string]*radixTree                   // build-time tree per method
+	frozen atomic.Pointer[map[string]*radixTree]   // read-only snapshot for ServeHTTP
 }
 
 // Group represents a route group with a common prefix and middleware
@@ -45,7 +54,6 @@ type Group struct {
 type route struct {
 	pattern string
 	handler HandlerFunc
-	params  []string
 	before  []HandlerFunc
 	after   []HandlerFunc
 }
@@ -58,10 +66,50 @@ func NewRouter() *Router {
 	}
 }
 
+// altTrailingSlash returns the path with its trailing slash toggled.
+// "/" has no alternative — root never redirects to itself.
+func altTrailingSlash(path string) (string, bool) {
+	if path == "/" || path == "" {
+		return "", false
+	}
+	if strings.HasSuffix(path, "/") {
+		return strings.TrimSuffix(path, "/"), true
+	}
+	return path + "/", true
+}
+
+// canonicalMethod returns method in canonical (uppercase) form. It avoids
+// allocation for already-uppercase strings, which is the common case — the
+// fast path is a byte loop with no heap traffic. Hot path on every request.
+func canonicalMethod(m string) string {
+	for i := 0; i < len(m); i++ {
+		if m[i] >= 'a' && m[i] <= 'z' {
+			return strings.ToUpper(m)
+		}
+	}
+	return m
+}
+
+// view returns the routing trees, freezing them on first call. The returned
+// map must be treated as read-only — addRoute will panic before mutating it.
+func (r *Router) view() map[string]*radixTree {
+	if t := r.frozen.Load(); t != nil {
+		return *t
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if t := r.frozen.Load(); t != nil {
+		return *t
+	}
+	snap := r.trees
+	r.frozen.Store(&snap)
+	return snap
+}
+
 // getAllowedMethods returns a list of HTTP methods that have routes for the given path
 func (r *Router) getAllowedMethods(path string) []string {
 	var methods []string
-	for method, tree := range r.trees {
+	for method, tree := range r.view() {
 		if route, _ := tree.search(path); route != nil {
 			methods = append(methods, method)
 		}
@@ -69,32 +117,42 @@ func (r *Router) getAllowedMethods(path string) []string {
 	return methods
 }
 
-// addRoute adds a route to the router
-// Logs a warning if the route pattern already exists (will be overwritten)
-func (r *Router) addRoute(method, pattern string, handler HandlerFunc) {
+// insertRoute is the single mutation point for the routing tables. It takes
+// the lock, checks the freeze flag, and panics if registration is happening
+// after the first request.
+func (r *Router) insertRoute(method, pattern string, rt *route) {
+	method = canonicalMethod(method)
+	if r.frozen.Load() != nil {
+		panic(fmt.Sprintf("surf: cannot register route after first request (%s %s)", method, pattern))
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.frozen.Load() != nil {
+		panic(fmt.Sprintf("surf: cannot register route after first request (%s %s)", method, pattern))
+	}
 	if r.routes[method] == nil {
 		r.routes[method] = make(map[string]*route)
 	}
 	if r.trees[method] == nil {
 		r.trees[method] = newRadixTree()
 	}
-
-	// Warn on route conflict (pattern already registered)
 	if _, exists := r.routes[method][pattern]; exists {
 		slog.Warn("route conflict: overwriting existing route",
 			"method", method,
 			"pattern", pattern,
 		)
 	}
-
-	params := extractParams(pattern)
-	rt := &route{
-		pattern: pattern,
-		handler: handler,
-		params:  params,
-	}
 	r.routes[method][pattern] = rt
 	r.trees[method].insert(pattern, rt)
+}
+
+// addRoute adds a route to the router.
+// Logs a warning if the route pattern already exists (will be overwritten).
+func (r *Router) addRoute(method, pattern string, handler HandlerFunc) {
+	r.insertRoute(method, pattern, &route{
+		pattern: pattern,
+		handler: handler,
+	})
 }
 
 // Get registers a GET route
@@ -226,26 +284,14 @@ func (g *Group) Options(pattern string, handler HandlerFunc) {
 	g.addRoute("OPTIONS", pattern, handler)
 }
 
-// addRoute adds a route to the group
+// addRoute adds a route to the group, attaching the group's before/after handlers.
 func (g *Group) addRoute(method, pattern string, handler HandlerFunc) {
-	fullPattern := g.prefix + pattern
-	if g.app.router.routes[method] == nil {
-		g.app.router.routes[method] = make(map[string]*route)
-	}
-	if g.app.router.trees[method] == nil {
-		g.app.router.trees[method] = newRadixTree()
-	}
-
-	params := extractParams(fullPattern)
-	rt := &route{
-		pattern: fullPattern,
+	g.app.router.insertRoute(method, g.prefix+pattern, &route{
+		pattern: g.prefix + pattern,
 		handler: handler,
-		params:  params,
 		before:  append([]HandlerFunc{}, g.before...),
 		after:   append([]HandlerFunc{}, g.after...),
-	}
-	g.app.router.routes[method][fullPattern] = rt
-	g.app.router.trees[method].insert(fullPattern, rt)
+	})
 }
 
 // ServeHTTP implements the http.Handler interface
@@ -273,17 +319,23 @@ func (app *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	app.serveLegacy(w, r)
 }
 
-// handleError logs the error internally and returns a generic error to the client
+// handleError logs the error internally and returns a generic 500 to the
+// client. If the handler already committed headers (e.g. wrote a 200 then
+// errored mid-body), we cannot rewrite the response — emit only the log
+// entry so the client receives a truncated body rather than a corrupt one
+// with "Internal Server Error" appended after partial output.
 func handleError(rw *ResponseWriter, r *http.Request, err error, context string) {
-	// Log the actual error internally for debugging
 	slog.Error("request handler error",
 		"error", err,
 		"context", context,
 		"method", r.Method,
 		"path", r.URL.Path,
 		"remote_addr", r.RemoteAddr,
+		"committed", rw.Committed(),
 	)
-	// Return generic error to client to avoid leaking internal details
+	if rw.Committed() {
+		return
+	}
 	http.Error(rw, "Internal Server Error", http.StatusInternalServerError)
 }
 
@@ -301,8 +353,28 @@ func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Use radix tree for O(log n) route matching
-	if tree, ok := app.router.trees[r.Method]; ok {
+	// Use radix tree for O(log n) route matching. view() freezes the
+	// routing tables on first call so further reads are lock-free.
+	method := canonicalMethod(r.Method)
+	if tree, ok := app.router.view()[method]; ok {
+		if app.redirectTrailingSlash {
+			if alt, exists := altTrailingSlash(r.URL.Path); exists {
+				if route, _ := tree.search(r.URL.Path); route == nil {
+					if route, _ := tree.search(alt); route != nil {
+						target := alt
+						if r.URL.RawQuery != "" {
+							target += "?" + r.URL.RawQuery
+						}
+						code := http.StatusMovedPermanently
+						if method != http.MethodGet && method != http.MethodHead {
+							code = http.StatusPermanentRedirect
+						}
+						http.Redirect(rw, r, target, code)
+						return
+					}
+				}
+			}
+		}
 		if route, params := tree.search(r.URL.Path); route != nil {
 			ctx := r.Context()
 			for key, value := range params {
@@ -373,78 +445,3 @@ func Param(r *http.Request, key string) string {
 	return str
 }
 
-// extractParams extracts parameter names from a route pattern
-func extractParams(pattern string) []string {
-	var params []string
-	parts := strings.Split(pattern, "/")
-	for _, part := range parts {
-		if strings.HasPrefix(part, ":") {
-			params = append(params, strings.TrimPrefix(part, ":"))
-		}
-	}
-	return params
-}
-
-// matchPath checks if a path matches a pattern and extracts parameters
-func matchPath(pattern, path string) (map[string]string, bool) {
-	patternParts := strings.Split(pattern, "/")
-	pathParts := strings.Split(path, "/")
-
-	if strings.Contains(pattern, "*") {
-		wildcardIndex := -1
-		for i, part := range patternParts {
-			if part == "*" {
-				wildcardIndex = i
-				break
-			}
-		}
-
-		if wildcardIndex != -1 {
-			if wildcardIndex > len(pathParts) {
-				return nil, false
-			}
-			for i := 0; i < wildcardIndex; i++ {
-				if i >= len(pathParts) {
-					return nil, false
-				}
-				if !strings.HasPrefix(patternParts[i], ":") && patternParts[i] != pathParts[i] {
-					return nil, false
-				}
-			}
-
-			// Extract parameters before wildcard
-			params := make(map[string]string)
-			for i := 0; i < wildcardIndex && i < len(pathParts); i++ {
-				if strings.HasPrefix(patternParts[i], ":") {
-					paramName := strings.TrimPrefix(patternParts[i], ":")
-					params[paramName] = pathParts[i]
-				}
-			}
-
-			// Wildcard matches the rest
-			if wildcardIndex < len(pathParts) {
-				params["*"] = strings.Join(pathParts[wildcardIndex:], "/")
-			}
-			return params, true
-		}
-	}
-
-	// Regular pattern matching
-	if len(patternParts) != len(pathParts) {
-		return nil, false
-	}
-
-	params := make(map[string]string)
-	for i, patternPart := range patternParts {
-		if strings.HasPrefix(patternPart, ":") {
-			// This is a parameter
-			paramName := strings.TrimPrefix(patternPart, ":")
-			params[paramName] = pathParts[i]
-		} else if patternPart != pathParts[i] {
-			// Static part doesn't match
-			return nil, false
-		}
-	}
-
-	return params, true
-}

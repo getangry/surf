@@ -79,3 +79,13 @@ func WithMaxHeaderBytes(n int) Option {
 		app.serverConfig.MaxHeaderBytes = n
 	}
 }
+
+// WithRedirectTrailingSlash enables automatic redirects between /foo and
+// /foo/ when only one variant is registered. Issued as 301 for GET/HEAD
+// and 308 for other methods so the request method and body are preserved.
+// Off by default; opt in if you don't care about strict path matching.
+func WithRedirectTrailingSlash() Option {
+	return func(app *App) {
+		app.redirectTrailingSlash = true
+	}
+}

@@ -383,6 +383,71 @@ func TestStaticFileServing(t *testing.T) {
 	})
 }
 
+func TestStaticFilenameWithDoubleDot(t *testing.T) {
+	tmpDir, err := os.MkdirTemp("", "surf-static-dotdot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	// A file whose name contains ".." but is not a traversal segment.
+	// The old strings.Contains(filePath, "..") check rejected these.
+	name := "release..2024.txt"
+	body := "version notes"
+	if err := os.WriteFile(filepath.Join(tmpDir, name), []byte(body), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	app := NewApp()
+	app.Static("/static", tmpDir)
+
+	req := httptest.NewRequest("GET", "/static/"+name, nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 for legitimate filename containing %q", rec.Code, "..")
+	}
+	if rec.Body.String() != body {
+		t.Errorf("body = %q, want %q", rec.Body.String(), body)
+	}
+}
+
+func TestStaticSymlinkEscapeBlocked(t *testing.T) {
+	outsideDir, err := os.MkdirTemp("", "surf-static-outside")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(outsideDir)
+
+	if err := os.WriteFile(filepath.Join(outsideDir, "secret.txt"), []byte("classified"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	servedDir, err := os.MkdirTemp("", "surf-static-served")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(servedDir)
+
+	// Plant a symlink inside the served directory pointing outside it.
+	link := filepath.Join(servedDir, "escape.txt")
+	if err := os.Symlink(filepath.Join(outsideDir, "secret.txt"), link); err != nil {
+		t.Skipf("symlink unsupported on this platform: %v", err)
+	}
+
+	app := NewApp()
+	app.Static("/static", servedDir)
+
+	req := httptest.NewRequest("GET", "/static/escape.txt", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code == http.StatusOK && rec.Body.String() == "classified" {
+		t.Fatal("symlink pointing outside the served root must not be followed")
+	}
+}
+
 func TestStaticFile(t *testing.T) {
 	// Create temp file
 	tmpFile, err := os.CreateTemp("", "surf-favicon-*.ico")
