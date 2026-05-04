@@ -67,6 +67,14 @@ func (rw *ResponseWriter) Written() bool {
 	return rw.written
 }
 
+// Committed reports whether response headers have been sent. Once true,
+// the status code and headers are locked in — the framework cannot recover
+// from a handler error by writing a 500 response, since the client has
+// already seen the original status.
+func (rw *ResponseWriter) Committed() bool {
+	return rw.wroteHeader
+}
+
 // StartTime returns the request start time
 func (rw *ResponseWriter) StartTime() time.Time {
 	return rw.startTime

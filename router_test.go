@@ -364,6 +364,28 @@ func TestAllHTTPMethods(t *testing.T) {
 	}
 }
 
+func TestHandleErrorAfterCommittedHeadersPreservesResponse(t *testing.T) {
+	app := NewApp()
+	app.Get("/partial", func(w http.ResponseWriter, r *http.Request) error {
+		// Handler writes a successful response, then errors. The framework
+		// must NOT append "Internal Server Error" or change the status.
+		w.WriteHeader(http.StatusAccepted)
+		w.Write([]byte("partial body"))
+		return http.ErrAbortHandler // any error
+	})
+
+	req := httptest.NewRequest("GET", "/partial", nil)
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusAccepted {
+		t.Errorf("status = %d, want %d (handler-committed status preserved)", rec.Code, http.StatusAccepted)
+	}
+	if rec.Body.String() != "partial body" {
+		t.Errorf("body = %q, want %q (no error message appended)", rec.Body.String(), "partial body")
+	}
+}
+
 func TestRouterPanicsOnRegistrationAfterFirstRequest(t *testing.T) {
 	app := NewApp()
 	app.Get("/before", func(w http.ResponseWriter, r *http.Request) error {

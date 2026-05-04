@@ -294,17 +294,23 @@ func (app *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	app.serveLegacy(w, r)
 }
 
-// handleError logs the error internally and returns a generic error to the client
+// handleError logs the error internally and returns a generic 500 to the
+// client. If the handler already committed headers (e.g. wrote a 200 then
+// errored mid-body), we cannot rewrite the response — emit only the log
+// entry so the client receives a truncated body rather than a corrupt one
+// with "Internal Server Error" appended after partial output.
 func handleError(rw *ResponseWriter, r *http.Request, err error, context string) {
-	// Log the actual error internally for debugging
 	slog.Error("request handler error",
 		"error", err,
 		"context", context,
 		"method", r.Method,
 		"path", r.URL.Path,
 		"remote_addr", r.RemoteAddr,
+		"committed", rw.Committed(),
 	)
-	// Return generic error to client to avoid leaking internal details
+	if rw.Committed() {
+		return
+	}
 	http.Error(rw, "Internal Server Error", http.StatusInternalServerError)
 }
 
