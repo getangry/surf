@@ -44,6 +44,22 @@ cosmetic behavior change noted below.
   honoring `X-Forwarded-For` only for configured trusted proxy CIDRs.
   `RateLimitConfig` gains a `TrustedProxies` field.
 
+### Performance
+
+- The per-request hot path was reworked. surf previously threaded the `App`,
+  the `ResponseWriter`, and every path parameter through separate
+  `context.WithValue` calls, and allocated a `customData` map and a `params`
+  map on every request. All per-request state now lives in a single `reqState`
+  that also serves as the request context, parameters are resolved into an
+  inline buffer, and the `customData` map is allocated lazily.
+- Result on an isolated param-route benchmark: **416 ns/op → 150 ns/op and
+  14 allocs/op → 3** (the two framework allocations are the `reqState` and the
+  `r.WithContext` request copy). surf now outperforms chi; gin and echo remain
+  faster because their handler signature receives a pooled context object
+  directly, avoiding the request copy entirely.
+- A `benchmarks/` module (separate, so surf stays dependency-free) compares
+  surf against gin, echo, chi, and `net/http.ServeMux`.
+
 ### Changed
 
 - The default response for an *unhandled* handler error is now a JSON envelope

@@ -21,14 +21,23 @@ type ResponseWriter struct {
 	mu          sync.RWMutex
 }
 
-// NewResponseWriter creates a new ResponseWriter
+// NewResponseWriter creates a new ResponseWriter. The customData map is
+// allocated lazily on first Set, so a response that stores no custom data
+// costs nothing extra.
 func NewResponseWriter(w http.ResponseWriter) *ResponseWriter {
 	return &ResponseWriter{
 		ResponseWriter: w,
 		status:         http.StatusOK,
 		startTime:      time.Now(),
-		customData:     make(map[string]interface{}),
 	}
+}
+
+// initWriter wires up the zero-valued ResponseWriter embedded in a reqState to
+// wrap w, avoiding a separate ResponseWriter allocation per request.
+func (rw *ResponseWriter) initWriter(w http.ResponseWriter) {
+	rw.ResponseWriter = w
+	rw.status = http.StatusOK
+	rw.startTime = time.Now()
 }
 
 // WriteHeader captures the status code and writes the header
@@ -80,6 +89,9 @@ func (rw *ResponseWriter) Latency() time.Duration {
 // Set adds a custom value to the ResponseWriter (thread-safe)
 func (rw *ResponseWriter) Set(key string, value interface{}) {
 	rw.mu.Lock()
+	if rw.customData == nil {
+		rw.customData = make(map[string]interface{})
+	}
 	rw.customData[key] = value
 	rw.mu.Unlock()
 }
@@ -156,10 +168,11 @@ func (rw *ResponseWriter) ResponseController() *http.ResponseController {
 	return http.NewResponseController(rw)
 }
 
-// GetResponseWriter retrieves the ResponseWriter from the request context
+// GetResponseWriter retrieves the ResponseWriter from the request context.
+// It returns nil before the router has begun handling the request.
 func GetResponseWriter(r *http.Request) *ResponseWriter {
-	if rw, ok := r.Context().Value(responseKey{}).(*ResponseWriter); ok {
-		return rw
+	if st := stateFromRequest(r); st != nil && st.rw.ResponseWriter != nil {
+		return &st.rw
 	}
 	return nil
 }

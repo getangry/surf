@@ -143,11 +143,11 @@ func GetUserID(r *http.Request) string {
 // Returns zero value if service not found or type assertion fails
 func GetService[T any](r *http.Request, key any) T {
 	var zero T
-	app, ok := r.Context().Value(appKey{}).(*App)
-	if !ok {
+	st := stateFromRequest(r)
+	if st == nil || st.app == nil {
 		return zero
 	}
-	service := app.GetService(key)
+	service := st.app.GetService(key)
 	if service == nil {
 		return zero
 	}

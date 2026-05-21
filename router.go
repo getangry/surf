@@ -1,7 +1,6 @@
 package surf
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -301,10 +300,14 @@ func (g *Group) addRoute(method, pattern string, handler HandlerFunc, routeMiddl
 	g.app.router.trees[method].insert(fullPattern, rt)
 }
 
-// ServeHTTP implements the http.Handler interface
+// ServeHTTP implements the http.Handler interface.
+//
+// All per-request framework state is carried in a single reqState that also
+// serves as the request's context, so the hot path allocates only the
+// reqState itself and the one *http.Request copy r.WithContext requires.
 func (app *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ctx := context.WithValue(r.Context(), appKey{}, app)
-	r = r.WithContext(ctx)
+	st := newReqState(app, r.Context())
+	r = r.WithContext(st)
 
 	// If we have standard middlewares, chain them
 	if len(app.middlewares) > 0 {
@@ -380,12 +383,20 @@ func (app *App) runRoute(rw *ResponseWriter, r *http.Request, rt *route) error {
 	return handlerErr
 }
 
-// serveLegacy handles the original Before/After middleware pattern
+// serveLegacy runs the before/route/after handler pipeline. It reuses the
+// pooled ResponseWriter and parameter slice carried by the request's reqState,
+// so it performs no per-request allocation.
 func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
-	rw := NewResponseWriter(w)
+	st := stateFromRequest(r)
 
-	ctx := context.WithValue(r.Context(), responseKey{}, rw)
-	r = r.WithContext(ctx)
+	var rw *ResponseWriter
+	if st != nil {
+		rw = &st.rw
+		rw.initWriter(w)
+	} else {
+		// Defensive: a request that did not pass through ServeHTTP.
+		rw = NewResponseWriter(w)
+	}
 
 	for _, handler := range app.before {
 		if err := handler(rw, r); err != nil {
@@ -396,13 +407,14 @@ func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
 
 	// Use radix tree for O(log n) route matching
 	if tree, ok := app.router.trees[r.Method]; ok {
-		if route, params := tree.search(r.URL.Path); route != nil {
-			ctx := r.Context()
-			for key, value := range params {
-				ctx = context.WithValue(ctx, contextKey(key), value)
-			}
-			r = r.WithContext(ctx)
-
+		var route *route
+		if st != nil {
+			// Allocation-free: parameters land in the pooled slice.
+			route = tree.searchKV(r.URL.Path, &st.params)
+		} else {
+			route, _ = tree.search(r.URL.Path)
+		}
+		if route != nil {
 			for _, handler := range route.before {
 				if err := handler(rw, r); err != nil {
 					app.renderError(rw, r, err, "route.before")
@@ -453,17 +465,19 @@ func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Param extracts a path parameter from the request context
+// Param extracts a path parameter resolved by the router. The wildcard match
+// is available as Param(r, "*").
 func Param(r *http.Request, key string) string {
-	value := r.Context().Value(contextKey(key))
-	if value == nil {
+	st := stateFromRequest(r)
+	if st == nil {
 		return ""
 	}
-	str, ok := value.(string)
-	if !ok {
-		return ""
+	for i := range st.params {
+		if st.params[i].key == key {
+			return st.params[i].val
+		}
 	}
-	return str
+	return ""
 }
 
 // extractParams extracts parameter names from a route pattern

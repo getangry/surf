@@ -30,11 +30,11 @@ func Provide[T any](app *App, service T) {
 // whether a service of that exact type was found.
 func Service[T any](r *http.Request) (T, bool) {
 	var zero T
-	app, ok := r.Context().Value(appKey{}).(*App)
-	if !ok {
+	st := stateFromRequest(r)
+	if st == nil || st.app == nil {
 		return zero, false
 	}
-	v := app.GetService(typeKey[T]())
+	v := st.app.GetService(typeKey[T]())
 	if v == nil {
 		return zero, false
 	}

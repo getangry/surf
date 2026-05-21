@@ -1,10 +1,5 @@
 package surf
 
-// responseKey is the context key for storing the ResponseWriter
-type responseKey struct{}
-
-// appKey is the context key for storing the App instance
-type appKey struct{}
-
-// contextKey is a type for context keys
+// contextKey is a type for context keys used by the logging helpers
+// (request_id, user_id) and surf.Get's context fallback.
 type contextKey string
