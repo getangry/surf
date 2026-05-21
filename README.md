@@ -532,9 +532,20 @@ app.Use(surf.RateLimit(surf.RateLimitConfig{
 
 ### WebSockets
 
+`Upgrade` enforces a **same-origin policy by default** — a handshake whose
+`Origin` host differs from the request `Host` is rejected with 403, preventing
+cross-site WebSocket hijacking. To accept specific cross-origin clients, use
+`UpgradeWithConfig`:
+
+```go
+conn, err := surf.UpgradeWithConfig(w, r, surf.UpgradeConfig{
+    CheckOrigin: surf.AllowOrigins("https://app.example.com"),
+})
+```
+
 ```go
 app.Get("/ws", func(w http.ResponseWriter, r *http.Request) error {
-    conn, err := surf.Upgrade(w, r)
+    conn, err := surf.Upgrade(w, r) // same-origin only
     if err != nil {
         return err
     }

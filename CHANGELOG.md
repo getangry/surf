@@ -42,7 +42,10 @@ cosmetic behavior change noted below.
   text exposition format, with no external dependencies.
 - **WebSockets.** `Upgrade` performs the RFC 6455 handshake and returns a
   `WSConn` supporting text/binary messages, fragmentation, and automatic ping
-  replies. `IsWebSocketUpgrade` detects upgrade requests.
+  replies. `IsWebSocketUpgrade` detects upgrade requests. `Upgrade` enforces a
+  same-origin policy by default (`SameOriginCheck`) to prevent cross-site
+  WebSocket hijacking; `UpgradeWithConfig` accepts an `UpgradeConfig` with a
+  `CheckOrigin` hook, and `AllowOrigins` builds one from an allowlist.
 - **Logging path filters.** `LoggingMiddlewareWithConfig` accepts `SkipPaths`
   (exact or trailing-`*` prefix) to exclude paths such as health probes.
 - **Proxy-aware client IP.** `IPFromRequest` and `KeyByIP` derive the client IP,

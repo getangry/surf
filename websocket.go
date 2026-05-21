@@ -10,6 +10,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 )
@@ -72,13 +73,84 @@ type WSConn struct {
 	maxMessageSize int64
 }
 
-// Upgrade completes the RFC 6455 handshake on r and returns a WSConn. The
-// caller owns the connection and must Close it. The underlying http.Server no
-// longer manages the connection after a successful upgrade.
-func Upgrade(w http.ResponseWriter, r *http.Request) (*WSConn, error) {
-	if !IsWebSocketUpgrade(r) {
-		return nil, errors.New("surf: request is not a websocket upgrade")
+// UpgradeConfig configures the WebSocket handshake.
+type UpgradeConfig struct {
+	// CheckOrigin decides whether a handshake from the request's Origin is
+	// allowed. It returns true to permit the upgrade. When nil, SameOriginCheck
+	// is used: the handshake is allowed only if the Origin header is absent or
+	// its host matches the request Host.
+	//
+	// WebSocket connections are not subject to the Same-Origin Policy and CORS
+	// does not apply to them, yet browsers attach cookies to cross-origin
+	// handshakes. Without an origin check, a cookie-authenticated WebSocket
+	// endpoint is open to cross-site WebSocket hijacking. Override CheckOrigin
+	// only when you intend to accept cross-origin clients.
+	CheckOrigin func(r *http.Request) bool
+}
+
+// SameOriginCheck is the default CheckOrigin: it permits a handshake when the
+// request carries no Origin header (non-browser clients) or when the Origin's
+// host equals the request Host.
+func SameOriginCheck(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
 	}
+	u, err := url.Parse(origin)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
+// AllowOrigins returns a CheckOrigin function permitting handshakes whose
+// Origin header exactly matches one of the given origins (compared
+// case-insensitively, e.g. "https://app.example.com"). A request without an
+// Origin header is allowed.
+func AllowOrigins(origins ...string) func(r *http.Request) bool {
+	allowed := append([]string{}, origins...)
+	return func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			return true
+		}
+		for _, o := range allowed {
+			if strings.EqualFold(o, origin) {
+				return true
+			}
+		}
+		return false
+	}
+}
+
+// Upgrade completes the RFC 6455 handshake on r and returns a WSConn, applying
+// the default same-origin policy (see SameOriginCheck). Use UpgradeWithConfig
+// to accept cross-origin clients. The caller owns the returned connection and
+// must Close it; the http.Server no longer manages it after a successful
+// upgrade.
+func Upgrade(w http.ResponseWriter, r *http.Request) (*WSConn, error) {
+	return UpgradeWithConfig(w, r, UpgradeConfig{})
+}
+
+// UpgradeWithConfig is Upgrade with an explicit UpgradeConfig.
+//
+// A request that is not a valid upgrade fails with a 400 *HTTPError; a request
+// rejected by CheckOrigin fails with a 403 *HTTPError — in both cases the
+// connection is not hijacked, so a handler can simply `return err` and let the
+// error renderer respond.
+func UpgradeWithConfig(w http.ResponseWriter, r *http.Request, config UpgradeConfig) (*WSConn, error) {
+	if !IsWebSocketUpgrade(r) {
+		return nil, NewHTTPError(http.StatusBadRequest, "request is not a websocket upgrade")
+	}
+
+	checkOrigin := config.CheckOrigin
+	if checkOrigin == nil {
+		checkOrigin = SameOriginCheck
+	}
+	if !checkOrigin(r) {
+		return nil, NewHTTPError(http.StatusForbidden, "websocket origin not allowed")
+	}
+
 	hj, ok := w.(http.Hijacker)
 	if !ok {
 		return nil, errors.New("surf: ResponseWriter does not support hijacking")

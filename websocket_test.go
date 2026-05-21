@@ -2,6 +2,7 @@ package surf
 
 import (
 	"bufio"
+	"errors"
 	"io"
 	"net"
 	"net/http"
@@ -314,5 +315,103 @@ func TestWSWriteMessageRejectsBadType(t *testing.T) {
 	ws := newTestWSConn(server)
 	if err := ws.WriteMessage(0x9, []byte("x")); err == nil {
 		t.Error("expected error for non-data message type")
+	}
+}
+
+func wsUpgradeRequest(host, origin string) *http.Request {
+	r := httptest.NewRequest("GET", "http://"+host+"/ws", nil)
+	r.Host = host
+	r.Header.Set("Connection", "Upgrade")
+	r.Header.Set("Upgrade", "websocket")
+	r.Header.Set("Sec-WebSocket-Version", "13")
+	r.Header.Set("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+	if origin != "" {
+		r.Header.Set("Origin", origin)
+	}
+	return r
+}
+
+func is403(err error) bool {
+	var he *HTTPError
+	return errors.As(err, &he) && he.Code == http.StatusForbidden
+}
+
+func TestSameOriginCheck(t *testing.T) {
+	cases := []struct {
+		host, origin string
+		want         bool
+	}{
+		{"app.example", "", true},                          // no Origin: non-browser client
+		{"app.example", "https://app.example", true},       // same host
+		{"app.example", "http://app.example", true},        // scheme is not compared
+		{"app.example", "https://evil.example", false},     // different host
+		{"app.example", "https://app.example:8443", false}, // different port
+		{"app.example", "garbage", false},                  // unparseable -> empty host
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest("GET", "http://"+c.host+"/", nil)
+		r.Host = c.host
+		if c.origin != "" {
+			r.Header.Set("Origin", c.origin)
+		}
+		if got := SameOriginCheck(r); got != c.want {
+			t.Errorf("SameOriginCheck(host=%q origin=%q) = %v, want %v", c.host, c.origin, got, c.want)
+		}
+	}
+}
+
+func TestAllowOrigins(t *testing.T) {
+	check := AllowOrigins("https://a.example", "https://b.example")
+	mk := func(origin string) *http.Request {
+		r := httptest.NewRequest("GET", "/", nil)
+		if origin != "" {
+			r.Header.Set("Origin", origin)
+		}
+		return r
+	}
+	if !check(mk("")) {
+		t.Error("missing Origin should be allowed")
+	}
+	if !check(mk("https://b.example")) {
+		t.Error("listed origin should be allowed")
+	}
+	if check(mk("https://evil.example")) {
+		t.Error("unlisted origin must be rejected")
+	}
+}
+
+func TestUpgradeRejectsCrossOrigin(t *testing.T) {
+	r := wsUpgradeRequest("victim.example", "https://evil.example")
+	_, err := Upgrade(httptest.NewRecorder(), r)
+	if !is403(err) {
+		t.Fatalf("cross-origin upgrade: err = %v, want 403 HTTPError", err)
+	}
+}
+
+func TestUpgradeAllowsSameOrigin(t *testing.T) {
+	r := wsUpgradeRequest("victim.example", "http://victim.example")
+	// httptest.Recorder cannot hijack, so the upgrade still fails — but it must
+	// get past the origin check, i.e. not be rejected with 403.
+	_, err := Upgrade(httptest.NewRecorder(), r)
+	if is403(err) {
+		t.Fatalf("same-origin upgrade was rejected: %v", err)
+	}
+}
+
+func TestUpgradeWithConfigCustomCheckOrigin(t *testing.T) {
+	r := wsUpgradeRequest("victim.example", "https://partner.example")
+	cfg := UpgradeConfig{CheckOrigin: AllowOrigins("https://partner.example")}
+	_, err := UpgradeWithConfig(httptest.NewRecorder(), r, cfg)
+	if is403(err) {
+		t.Fatalf("custom CheckOrigin did not permit the configured origin: %v", err)
+	}
+}
+
+func TestUpgradeRejectsNonWebSocket(t *testing.T) {
+	r := httptest.NewRequest("GET", "/ws", nil)
+	_, err := Upgrade(httptest.NewRecorder(), r)
+	var he *HTTPError
+	if !errors.As(err, &he) || he.Code != http.StatusBadRequest {
+		t.Fatalf("non-websocket request: err = %v, want 400 HTTPError", err)
 	}
 }
