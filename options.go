@@ -79,3 +79,13 @@ func WithMaxHeaderBytes(n int) Option {
 		app.serverConfig.MaxHeaderBytes = n
 	}
 }
+
+// WithErrorHandler sets a custom renderer for errors returned by handlers and
+// before/after handlers. When unset, DefaultErrorRenderer writes a JSON error
+// envelope. The renderer is only invoked when the response has not already
+// been written.
+func WithErrorHandler(renderer ErrorRenderer) Option {
+	return func(app *App) {
+		app.errorHandler = renderer
+	}
+}

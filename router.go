@@ -2,6 +2,7 @@ package surf
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -35,19 +36,22 @@ type Router struct {
 
 // Group represents a route group with a common prefix and middleware
 type Group struct {
-	app    *App
-	prefix string
-	before []HandlerFunc
-	after  []HandlerFunc
+	app         *App
+	prefix      string
+	before      []HandlerFunc
+	after       []HandlerFunc
+	middlewares []Middleware
+	skip        []string
 }
 
 // route represents a single route with its handler and path pattern
 type route struct {
-	pattern string
-	handler HandlerFunc
-	params  []string
-	before  []HandlerFunc
-	after   []HandlerFunc
+	pattern     string
+	handler     HandlerFunc
+	params      []string
+	before      []HandlerFunc
+	after       []HandlerFunc
+	middlewares []Middleware
 }
 
 // NewRouter creates a new router instance
@@ -71,7 +75,7 @@ func (r *Router) getAllowedMethods(path string) []string {
 
 // addRoute adds a route to the router
 // Logs a warning if the route pattern already exists (will be overwritten)
-func (r *Router) addRoute(method, pattern string, handler HandlerFunc) {
+func (r *Router) addRoute(method, pattern string, handler HandlerFunc, middleware []Middleware) {
 	if r.routes[method] == nil {
 		r.routes[method] = make(map[string]*route)
 	}
@@ -89,47 +93,49 @@ func (r *Router) addRoute(method, pattern string, handler HandlerFunc) {
 
 	params := extractParams(pattern)
 	rt := &route{
-		pattern: pattern,
-		handler: handler,
-		params:  params,
+		pattern:     pattern,
+		handler:     handler,
+		params:      params,
+		middlewares: middleware,
 	}
 	r.routes[method][pattern] = rt
 	r.trees[method].insert(pattern, rt)
 }
 
-// Get registers a GET route
-func (app *App) Get(pattern string, handler HandlerFunc) {
-	app.router.addRoute("GET", pattern, handler)
+// Get registers a GET route. Any middleware is applied to this route only,
+// wrapping the handler in declaration order (outermost first).
+func (app *App) Get(pattern string, handler HandlerFunc, middleware ...Middleware) {
+	app.router.addRoute("GET", pattern, handler, middleware)
 }
 
-// Post registers a POST route
-func (app *App) Post(pattern string, handler HandlerFunc) {
-	app.router.addRoute("POST", pattern, handler)
+// Post registers a POST route with optional per-route middleware.
+func (app *App) Post(pattern string, handler HandlerFunc, middleware ...Middleware) {
+	app.router.addRoute("POST", pattern, handler, middleware)
 }
 
-// Put registers a PUT route
-func (app *App) Put(pattern string, handler HandlerFunc) {
-	app.router.addRoute("PUT", pattern, handler)
+// Put registers a PUT route with optional per-route middleware.
+func (app *App) Put(pattern string, handler HandlerFunc, middleware ...Middleware) {
+	app.router.addRoute("PUT", pattern, handler, middleware)
 }
 
-// Delete registers a DELETE route
-func (app *App) Delete(pattern string, handler HandlerFunc) {
-	app.router.addRoute("DELETE", pattern, handler)
+// Delete registers a DELETE route with optional per-route middleware.
+func (app *App) Delete(pattern string, handler HandlerFunc, middleware ...Middleware) {
+	app.router.addRoute("DELETE", pattern, handler, middleware)
 }
 
-// Patch registers a PATCH route
-func (app *App) Patch(pattern string, handler HandlerFunc) {
-	app.router.addRoute("PATCH", pattern, handler)
+// Patch registers a PATCH route with optional per-route middleware.
+func (app *App) Patch(pattern string, handler HandlerFunc, middleware ...Middleware) {
+	app.router.addRoute("PATCH", pattern, handler, middleware)
 }
 
-// Head registers a HEAD route
-func (app *App) Head(pattern string, handler HandlerFunc) {
-	app.router.addRoute("HEAD", pattern, handler)
+// Head registers a HEAD route with optional per-route middleware.
+func (app *App) Head(pattern string, handler HandlerFunc, middleware ...Middleware) {
+	app.router.addRoute("HEAD", pattern, handler, middleware)
 }
 
-// Options registers an OPTIONS route
-func (app *App) Options(pattern string, handler HandlerFunc) {
-	app.router.addRoute("OPTIONS", pattern, handler)
+// Options registers an OPTIONS route with optional per-route middleware.
+func (app *App) Options(pattern string, handler HandlerFunc, middleware ...Middleware) {
+	app.router.addRoute("OPTIONS", pattern, handler, middleware)
 }
 
 // Before adds a middleware handler that runs before the main handler
@@ -162,20 +168,25 @@ func (app *App) UseFunc(fn MiddlewareFunc) {
 // Group creates a new route group with a common prefix
 func (app *App) Group(prefix string) *Group {
 	return &Group{
-		app:    app,
-		prefix: prefix,
-		before: []HandlerFunc{},
-		after:  []HandlerFunc{},
+		app:         app,
+		prefix:      prefix,
+		before:      []HandlerFunc{},
+		after:       []HandlerFunc{},
+		middlewares: []Middleware{},
+		skip:        []string{},
 	}
 }
 
-// Group creates a nested route group
+// Group creates a nested route group. It inherits the parent group's before
+// and after handlers, middleware, and skip patterns.
 func (g *Group) Group(prefix string) *Group {
 	return &Group{
-		app:    g.app,
-		prefix: g.prefix + prefix,
-		before: append([]HandlerFunc{}, g.before...),
-		after:  append([]HandlerFunc{}, g.after...),
+		app:         g.app,
+		prefix:      g.prefix + prefix,
+		before:      append([]HandlerFunc{}, g.before...),
+		after:       append([]HandlerFunc{}, g.after...),
+		middlewares: append([]Middleware{}, g.middlewares...),
+		skip:        append([]string{}, g.skip...),
 	}
 }
 
@@ -191,43 +202,71 @@ func (g *Group) After(handler HandlerFunc) *Group {
 	return g
 }
 
-// Get registers a GET route in the group
-func (g *Group) Get(pattern string, handler HandlerFunc) {
-	g.addRoute("GET", pattern, handler)
+// Use adds standard middleware applied to every route in the group. Unlike
+// Before, middleware can short-circuit by not calling next and propagates
+// context changes via r.WithContext.
+func (g *Group) Use(middleware ...Middleware) *Group {
+	g.middlewares = append(g.middlewares, middleware...)
+	return g
 }
 
-// Post registers a POST route in the group
-func (g *Group) Post(pattern string, handler HandlerFunc) {
-	g.addRoute("POST", pattern, handler)
+// Skip excludes routes whose full pattern matches any of the given patterns
+// from this group's Before, After, and Use middleware. A pattern ending in "*"
+// matches by prefix; otherwise it must match the full route pattern exactly.
+// Call Skip before registering the affected routes.
+//
+//	api := app.Group("/api").Before(requireAuth)
+//	api.Skip("/api/health")
+//	api.Get("/health", healthz)   // no auth
+//	api.Get("/users", listUsers)  // auth applied
+func (g *Group) Skip(patterns ...string) *Group {
+	g.skip = append(g.skip, patterns...)
+	return g
 }
 
-// Put registers a PUT route in the group
-func (g *Group) Put(pattern string, handler HandlerFunc) {
-	g.addRoute("PUT", pattern, handler)
+// isSkipped reports whether fullPattern is excluded from group middleware.
+func (g *Group) isSkipped(fullPattern string) bool {
+	return matchAnyGlob(fullPattern, g.skip)
 }
 
-// Delete registers a DELETE route in the group
-func (g *Group) Delete(pattern string, handler HandlerFunc) {
-	g.addRoute("DELETE", pattern, handler)
+// Get registers a GET route in the group with optional per-route middleware.
+func (g *Group) Get(pattern string, handler HandlerFunc, middleware ...Middleware) {
+	g.addRoute("GET", pattern, handler, middleware)
 }
 
-// Patch registers a PATCH route in the group
-func (g *Group) Patch(pattern string, handler HandlerFunc) {
-	g.addRoute("PATCH", pattern, handler)
+// Post registers a POST route in the group with optional per-route middleware.
+func (g *Group) Post(pattern string, handler HandlerFunc, middleware ...Middleware) {
+	g.addRoute("POST", pattern, handler, middleware)
 }
 
-// Head registers a HEAD route in the group
-func (g *Group) Head(pattern string, handler HandlerFunc) {
-	g.addRoute("HEAD", pattern, handler)
+// Put registers a PUT route in the group with optional per-route middleware.
+func (g *Group) Put(pattern string, handler HandlerFunc, middleware ...Middleware) {
+	g.addRoute("PUT", pattern, handler, middleware)
 }
 
-// Options registers an OPTIONS route in the group
-func (g *Group) Options(pattern string, handler HandlerFunc) {
-	g.addRoute("OPTIONS", pattern, handler)
+// Delete registers a DELETE route in the group with optional per-route middleware.
+func (g *Group) Delete(pattern string, handler HandlerFunc, middleware ...Middleware) {
+	g.addRoute("DELETE", pattern, handler, middleware)
 }
 
-// addRoute adds a route to the group
-func (g *Group) addRoute(method, pattern string, handler HandlerFunc) {
+// Patch registers a PATCH route in the group with optional per-route middleware.
+func (g *Group) Patch(pattern string, handler HandlerFunc, middleware ...Middleware) {
+	g.addRoute("PATCH", pattern, handler, middleware)
+}
+
+// Head registers a HEAD route in the group with optional per-route middleware.
+func (g *Group) Head(pattern string, handler HandlerFunc, middleware ...Middleware) {
+	g.addRoute("HEAD", pattern, handler, middleware)
+}
+
+// Options registers an OPTIONS route in the group with optional per-route middleware.
+func (g *Group) Options(pattern string, handler HandlerFunc, middleware ...Middleware) {
+	g.addRoute("OPTIONS", pattern, handler, middleware)
+}
+
+// addRoute adds a route to the group, attaching group and per-route middleware
+// unless the route's full pattern has been excluded with Skip.
+func (g *Group) addRoute(method, pattern string, handler HandlerFunc, routeMiddleware []Middleware) {
 	fullPattern := g.prefix + pattern
 	if g.app.router.routes[method] == nil {
 		g.app.router.routes[method] = make(map[string]*route)
@@ -236,14 +275,28 @@ func (g *Group) addRoute(method, pattern string, handler HandlerFunc) {
 		g.app.router.trees[method] = newRadixTree()
 	}
 
-	params := extractParams(fullPattern)
+	if _, exists := g.app.router.routes[method][fullPattern]; exists {
+		slog.Warn("route conflict: overwriting existing route",
+			"method", method,
+			"pattern", fullPattern,
+		)
+	}
+
 	rt := &route{
 		pattern: fullPattern,
 		handler: handler,
-		params:  params,
-		before:  append([]HandlerFunc{}, g.before...),
-		after:   append([]HandlerFunc{}, g.after...),
+		params:  extractParams(fullPattern),
 	}
+
+	if g.isSkipped(fullPattern) {
+		// Excluded from group middleware; per-route middleware still applies.
+		rt.middlewares = append([]Middleware{}, routeMiddleware...)
+	} else {
+		rt.before = append([]HandlerFunc{}, g.before...)
+		rt.after = append([]HandlerFunc{}, g.after...)
+		rt.middlewares = append(append([]Middleware{}, g.middlewares...), routeMiddleware...)
+	}
+
 	g.app.router.routes[method][fullPattern] = rt
 	g.app.router.trees[method].insert(fullPattern, rt)
 }
@@ -273,18 +326,58 @@ func (app *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	app.serveLegacy(w, r)
 }
 
-// handleError logs the error internally and returns a generic error to the client
-func handleError(rw *ResponseWriter, r *http.Request, err error, context string) {
-	// Log the actual error internally for debugging
-	slog.Error("request handler error",
+// renderError turns an error returned by a handler (or before/after handler)
+// into a response. The Abort sentinel and http.ErrAbortHandler are treated as
+// successful, silent completion. Other errors are logged; if the response has
+// not been written yet, the configured ErrorRenderer (or DefaultErrorRenderer)
+// produces the body.
+func (app *App) renderError(rw *ResponseWriter, r *http.Request, err error, context string) {
+	if err == nil || errors.Is(err, Abort) || errors.Is(err, http.ErrAbortHandler) {
+		return
+	}
+
+	logger := app.logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	logger.Error("request handler error",
 		"error", err,
 		"context", context,
 		"method", r.Method,
 		"path", r.URL.Path,
 		"remote_addr", r.RemoteAddr,
 	)
-	// Return generic error to client to avoid leaking internal details
-	http.Error(rw, "Internal Server Error", http.StatusInternalServerError)
+
+	// The handler already produced a response; writing again would corrupt it.
+	if rw.wroteHeader || rw.written {
+		return
+	}
+
+	renderer := app.errorHandler
+	if renderer == nil {
+		renderer = DefaultErrorRenderer
+	}
+	renderer(rw, r, err)
+}
+
+// runRoute executes a route's handler wrapped in its per-route middleware and
+// returns the handler's error (nil if a middleware short-circuited the chain).
+func (app *App) runRoute(rw *ResponseWriter, r *http.Request, rt *route) error {
+	if len(rt.middlewares) == 0 {
+		return rt.handler(rw, r)
+	}
+
+	var handlerErr error
+	final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		handlerErr = rt.handler(w, r)
+	})
+
+	var h http.Handler = final
+	for i := len(rt.middlewares) - 1; i >= 0; i-- {
+		h = rt.middlewares[i](h)
+	}
+	h.ServeHTTP(rw, r)
+	return handlerErr
 }
 
 // serveLegacy handles the original Before/After middleware pattern
@@ -296,7 +389,7 @@ func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
 
 	for _, handler := range app.before {
 		if err := handler(rw, r); err != nil {
-			handleError(rw, r, err, "app.before")
+			app.renderError(rw, r, err, "app.before")
 			return
 		}
 	}
@@ -312,26 +405,26 @@ func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
 
 			for _, handler := range route.before {
 				if err := handler(rw, r); err != nil {
-					handleError(rw, r, err, "route.before")
+					app.renderError(rw, r, err, "route.before")
 					return
 				}
 			}
 
-			if err := route.handler(rw, r); err != nil {
-				handleError(rw, r, err, "route.handler")
+			if err := app.runRoute(rw, r, route); err != nil {
+				app.renderError(rw, r, err, "route.handler")
 				return
 			}
 
 			for _, handler := range route.after {
 				if err := handler(rw, r); err != nil {
-					handleError(rw, r, err, "route.after")
+					app.renderError(rw, r, err, "route.after")
 					return
 				}
 			}
 
 			for _, handler := range app.after {
 				if err := handler(rw, r); err != nil {
-					handleError(rw, r, err, "app.after")
+					app.renderError(rw, r, err, "app.after")
 					return
 				}
 			}

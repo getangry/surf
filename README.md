@@ -6,16 +6,24 @@ A lightweight, high-performance HTTP web framework for Go with flexible middlewa
 
 - **Fast Routing**: Radix tree-based router with O(log n) route matching
 - Simple routing with path parameters and wildcards
-- Dual middleware system: standard middleware and Before/After handlers
+- **Per-route & per-group middleware**: attach standard middleware to a single route or a whole group, with `Skip` to exclude routes
+- **Error-returning handlers**: a returned error is rendered to the client by a configurable renderer
 - **Built-in Middleware**: CORS, Recovery, Rate Limiting, Timeout, Gzip compression
-- Built-in structured logging with slog integration
-- Configurable request logging with template-based formats
+- **Typed service container**: register and resolve dependencies by type
+- **Request binding & validation**: JSON body binding with size limits and a `Validator` hook
+- **JSON response envelopes**: `JSON`, `JSONData`, `JSONList`, `JSONError` helpers
+- **SPA serving**: single-page-app handler with `embed.FS` support and asset caching
+- **Metrics**: dependency-free Prometheus exposition middleware
+- **WebSockets**: RFC 6455 upgrade helper alongside existing SSE support
+- Built-in structured logging with slog integration, with path filtering
 - **Static File Serving**: Serve directories and individual files
 - **Query Parameter Helpers**: Type-safe query parameter parsing
 - **Custom Error Handlers**: Customizable 404 and 405 responses
 - Custom data storage in ResponseWriter
 - Request ID generation
 - Graceful server shutdown
+
+See [CHANGELOG.md](CHANGELOG.md) for the full v0.1.0 feature list.
 
 ## Quick Start
 
@@ -361,6 +369,155 @@ surf.Store(r, "operation", "create_user")
 // Retrieve data
 userID := surf.Get(r, "user_id").(string)
 operation := surf.GetString(r, "operation")
+```
+
+## v0.1.0 Features
+
+### Per-Route and Per-Group Middleware
+
+Attach standard middleware to a single route, or to a whole group:
+
+```go
+// Per-route: middleware wraps this handler only, outermost first.
+app.Post("/admin", createAdmin, requireAuth, auditLog)
+
+// Per-group: applies to every route registered on the group.
+api := app.Group("/api").Use(requireAuth, surf.RateLimitWithDefaults())
+api.Get("/users", listUsers)
+
+// Skip excludes specific routes from the group's Before/After/Use middleware.
+api.Skip("/api/health")
+api.Get("/health", healthz) // no auth, no rate limit
+```
+
+`requireAuth` here is a standard `surf.Middleware` (`func(http.Handler) http.Handler`).
+Unlike `Before` handlers, middleware can short-circuit by not calling `next` and
+can propagate context with `r.WithContext`.
+
+### Error-Returning Handlers
+
+A returned error is now rendered to the client. Return an `*HTTPError` to control
+the status and message; any other error becomes a generic 500 (internal detail is
+logged, never leaked):
+
+```go
+app.Get("/widgets/:id", func(w http.ResponseWriter, r *http.Request) error {
+    widget, err := store.Find(surf.Param(r, "id"))
+    if err != nil {
+        return surf.NewHTTPError(http.StatusNotFound, "widget not found")
+    }
+    return surf.JSONData(w, widget)
+})
+```
+
+If a handler already wrote the response, the renderer is skipped so the response
+is never corrupted. Return `surf.Abort` to stop processing silently. Override the
+renderer with `surf.NewApp(surf.WithErrorHandler(myRenderer))`.
+
+### Request Binding & Validation
+
+```go
+type SignupBody struct {
+    Name  string `json:"name"`
+    Email string `json:"email"`
+}
+
+func (b SignupBody) Validate() error {
+    if b.Name == "" {
+        return errors.New("name is required")
+    }
+    return nil
+}
+
+app.Post("/signup", func(w http.ResponseWriter, r *http.Request) error {
+    var body SignupBody
+    if err := surf.BindAndValidate(r, &body); err != nil {
+        return err // 400 for bad JSON, 413 over limit, 422 for validation
+    }
+    return surf.JSONDataStatus(w, http.StatusCreated, body)
+})
+```
+
+### JSON Response Envelopes
+
+```go
+surf.JSON(w, 200, v)                 // raw value
+surf.JSONData(w, v)                  // {"data": v}
+surf.JSONList(w, items, total)       // {"data": [...], "total": n}
+surf.JSONError(w, 404, "not found") // {"error": "...", "status": 404}
+```
+
+### Typed Service Container
+
+`Provide`/`Service` key services by type, eliminating the silent zero-value
+bug of string-keyed lookups:
+
+```go
+surf.Provide[*sql.DB](app, db)
+surf.Provide[Authenticator](app, oktaAuth) // register under an interface
+
+db, ok := surf.Service[*sql.DB](r)
+auth := surf.MustService[Authenticator](r) // panics if missing
+```
+
+### Single-Page Application Serving
+
+```go
+//go:embed all:dist
+var distFS embed.FS
+
+sub, _ := fs.Sub(distFS, "dist")
+app.SPA("/", sub) // index fallback, immutable caching for /assets/*
+```
+
+Use `SPAWithConfig` for a custom index, immutable directories, or
+`ExcludePrefixes` to 404 unknown API paths instead of serving HTML.
+
+### Metrics
+
+```go
+m := surf.NewMetricsRegistry()
+app.Use(m.Middleware())
+app.Get("/metrics", m.Handler()) // Prometheus text exposition
+```
+
+### Logging with Path Filters
+
+```go
+app.Use(surf.LoggingMiddlewareWithConfig(surf.LoggingConfig{
+    Format:    "{method} {path} {status} {latency_ms}ms",
+    SkipPaths: []string{"/health/*"},
+}))
+```
+
+### Rate Limiting Behind Proxies
+
+```go
+app.Use(surf.RateLimit(surf.RateLimitConfig{
+    RequestsPerSecond: 10,
+    TrustedProxies:    []string{"10.0.0.0/8"}, // X-Forwarded-For honored only from these
+}))
+```
+
+### WebSockets
+
+```go
+app.Get("/ws", func(w http.ResponseWriter, r *http.Request) error {
+    conn, err := surf.Upgrade(w, r)
+    if err != nil {
+        return err
+    }
+    defer conn.Close()
+    for {
+        mt, data, err := conn.ReadMessage()
+        if err != nil {
+            return surf.Abort
+        }
+        if err := conn.WriteMessage(mt, data); err != nil {
+            return surf.Abort
+        }
+    }
+})
 ```
 
 ## Examples

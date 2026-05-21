@@ -193,8 +193,15 @@ type RateLimitConfig struct {
 	// Burst is the maximum burst size
 	Burst int
 
-	// KeyFunc returns a key to identify the client (default: IP address)
+	// KeyFunc returns a key to identify the client (default: IP address).
+	// When nil, a key function derived from TrustedProxies is used.
 	KeyFunc func(r *http.Request) string
+
+	// TrustedProxies is a list of proxy CIDR blocks or addresses. When set and
+	// KeyFunc is nil, the client IP is taken from X-Forwarded-For only for
+	// requests arriving through these proxies. When empty, X-Forwarded-For is
+	// ignored and the connecting peer address is used.
+	TrustedProxies []string
 
 	// ExceededHandler is called when the rate limit is exceeded
 	// If nil, returns 429 Too Many Requests
@@ -303,7 +310,11 @@ func DefaultRateLimitConfig() RateLimitConfig {
 // RateLimit creates a rate limiting middleware with the given configuration
 func RateLimit(config RateLimitConfig) Middleware {
 	if config.KeyFunc == nil {
-		config.KeyFunc = DefaultRateLimitConfig().KeyFunc
+		if len(config.TrustedProxies) > 0 {
+			config.KeyFunc = KeyByIP(config.TrustedProxies...)
+		} else {
+			config.KeyFunc = DefaultRateLimitConfig().KeyFunc
+		}
 	}
 	if config.RequestsPerSecond <= 0 {
 		config.RequestsPerSecond = 10
