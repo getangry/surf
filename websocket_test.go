@@ -44,13 +44,36 @@ func newTestWSConn(c net.Conn) *WSConn {
 
 // maskedFrame builds a final, masked client frame (payload <= 125 bytes).
 func maskedFrame(opcode byte, payload []byte) []byte {
+	return maskedFrameFin(true, opcode, payload)
+}
+
+// maskedFrameFin builds a masked client frame with an explicit FIN bit.
+func maskedFrameFin(fin bool, opcode byte, payload []byte) []byte {
+	b0 := opcode
+	if fin {
+		b0 |= 0x80
+	}
 	key := []byte{0x12, 0x34, 0x56, 0x78}
-	f := []byte{0x80 | opcode, 0x80 | byte(len(payload))}
+	f := []byte{b0, 0x80 | byte(len(payload))}
 	f = append(f, key...)
 	for i, b := range payload {
 		f = append(f, b^key[i%4])
 	}
 	return f
+}
+
+// readServerFrame reads one unmasked server frame (payload <= 125 bytes).
+func readServerFrame(t *testing.T, r io.Reader) (opcode byte, payload []byte) {
+	t.Helper()
+	head := make([]byte, 2)
+	if _, err := io.ReadFull(r, head); err != nil {
+		t.Fatalf("read server frame head: %v", err)
+	}
+	payload = make([]byte, int(head[1]&0x7f))
+	if _, err := io.ReadFull(r, payload); err != nil {
+		t.Fatalf("read server frame payload: %v", err)
+	}
+	return head[0] & 0x0f, payload
 }
 
 func TestWSReadMaskedMessage(t *testing.T) {
@@ -186,5 +209,110 @@ func TestWSUpgradeEcho(t *testing.T) {
 	}
 	if string(payload) != "echo me" {
 		t.Errorf("echo = %q, want %q", payload, "echo me")
+	}
+}
+
+func TestWSFragmentedMessage(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	ws := newTestWSConn(server)
+
+	type result struct {
+		data []byte
+		err  error
+	}
+	resc := make(chan result, 1)
+	go func() {
+		_, data, err := ws.ReadMessage()
+		resc <- result{data, err}
+	}()
+
+	go func() {
+		_, _ = client.Write(maskedFrameFin(false, TextMessage, []byte("Hello ")))
+		_, _ = client.Write(maskedFrameFin(true, contOpcode, []byte("World")))
+	}()
+
+	res := <-resc
+	if res.err != nil {
+		t.Fatalf("ReadMessage: %v", res.err)
+	}
+	if string(res.data) != "Hello World" {
+		t.Errorf("reassembled = %q, want %q", res.data, "Hello World")
+	}
+}
+
+func TestWSPingIsAnswered(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	ws := newTestWSConn(server)
+
+	type result struct {
+		data []byte
+		err  error
+	}
+	resc := make(chan result, 1)
+	go func() {
+		_, data, err := ws.ReadMessage()
+		resc <- result{data, err}
+	}()
+
+	go func() {
+		_, _ = client.Write(maskedFrame(pingOpcode, []byte("hi")))
+		// The server auto-replies with a pong before delivering the message.
+		opcode, payload := readServerFrame(t, client)
+		if opcode != pongOpcode || string(payload) != "hi" {
+			t.Errorf("expected pong{hi}, got opcode=0x%x payload=%q", opcode, payload)
+		}
+		_, _ = client.Write(maskedFrame(TextMessage, []byte("after-ping")))
+	}()
+
+	res := <-resc
+	if res.err != nil {
+		t.Fatalf("ReadMessage: %v", res.err)
+	}
+	if string(res.data) != "after-ping" {
+		t.Errorf("message = %q, want after-ping", res.data)
+	}
+}
+
+func TestWSWriteBinary(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	ws := newTestWSConn(server)
+
+	go func() { _ = ws.WriteBinary([]byte{0xDE, 0xAD}) }()
+
+	opcode, payload := readServerFrame(t, client)
+	if opcode != BinaryMessage {
+		t.Errorf("opcode = 0x%x, want binary", opcode)
+	}
+	if len(payload) != 2 || payload[0] != 0xDE || payload[1] != 0xAD {
+		t.Errorf("payload = % x", payload)
+	}
+}
+
+func TestWSMaxMessageSize(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	ws := newTestWSConn(server)
+	ws.SetMaxMessageSize(4)
+
+	errc := make(chan error, 1)
+	go func() {
+		_, _, err := ws.ReadMessage()
+		errc <- err
+	}()
+	go func() { _, _ = client.Write(maskedFrame(TextMessage, []byte("too-long-payload"))) }()
+
+	if err := <-errc; err == nil {
+		t.Error("expected error for oversized message, got nil")
+	}
+}
+
+func TestWSWriteMessageRejectsBadType(t *testing.T) {
+	_, server := net.Pipe()
+	ws := newTestWSConn(server)
+	if err := ws.WriteMessage(0x9, []byte("x")); err == nil {
+		t.Error("expected error for non-data message type")
 	}
 }
