@@ -43,14 +43,18 @@ type Group struct {
 	skip        []string
 }
 
-// route represents a single route with its handler and path pattern
+// route represents a single route. A route carries either a standard handler
+// (with before/after handlers and Middleware) or a fast-path ctxHandler (with
+// CtxMiddleware) — never both.
 type route struct {
-	pattern     string
-	handler     HandlerFunc
-	params      []string
-	before      []HandlerFunc
-	after       []HandlerFunc
-	middlewares []Middleware
+	pattern        string
+	handler        HandlerFunc
+	params         []string
+	before         []HandlerFunc
+	after          []HandlerFunc
+	middlewares    []Middleware
+	ctxHandler     CtxHandler
+	ctxMiddlewares []CtxMiddleware
 }
 
 // NewRouter creates a new router instance
@@ -101,6 +105,30 @@ func (r *Router) addRoute(method, pattern string, handler HandlerFunc, middlewar
 	r.trees[method].insert(pattern, rt)
 }
 
+// addCtxRoute registers a fast-path Context route.
+func (r *Router) addCtxRoute(method, pattern string, handler CtxHandler, middleware []CtxMiddleware) {
+	if r.routes[method] == nil {
+		r.routes[method] = make(map[string]*route)
+	}
+	if r.trees[method] == nil {
+		r.trees[method] = newRadixTree()
+	}
+	if _, exists := r.routes[method][pattern]; exists {
+		slog.Warn("route conflict: overwriting existing route",
+			"method", method,
+			"pattern", pattern,
+		)
+	}
+	rt := &route{
+		pattern:        pattern,
+		params:         extractParams(pattern),
+		ctxHandler:     handler,
+		ctxMiddlewares: middleware,
+	}
+	r.routes[method][pattern] = rt
+	r.trees[method].insert(pattern, rt)
+}
+
 // Get registers a GET route. Any middleware is applied to this route only,
 // wrapping the handler in declaration order (outermost first).
 func (app *App) Get(pattern string, handler HandlerFunc, middleware ...Middleware) {
@@ -135,6 +163,23 @@ func (app *App) Head(pattern string, handler HandlerFunc, middleware ...Middlewa
 // Options registers an OPTIONS route with optional per-route middleware.
 func (app *App) Options(pattern string, handler HandlerFunc, middleware ...Middleware) {
 	app.router.addRoute("OPTIONS", pattern, handler, middleware)
+}
+
+// Handle registers a fast-path route whose handler receives a pooled *Context.
+// Unlike Get/Post, the router copies neither the request nor allocates
+// per-request state, so a Context route has zero framework allocations — use
+// it for the hottest endpoints. Compose fast-path middleware with CtxMiddleware.
+//
+//	app.Handle("GET", "/healthz", func(c *surf.Context) error {
+//	    return c.String(http.StatusOK, "ok")
+//	})
+//
+// Context routes are a self-contained fast lane: app-level standard Middleware
+// (Use) still wraps them, but app Before/After run with an empty request
+// context, so surf.Param is unavailable there — read parameters via the
+// *Context instead.
+func (app *App) Handle(method, pattern string, handler CtxHandler, middleware ...CtxMiddleware) {
+	app.router.addCtxRoute(strings.ToUpper(method), pattern, handler, middleware)
 }
 
 // Before adds a middleware handler that runs before the main handler
@@ -263,6 +308,13 @@ func (g *Group) Options(pattern string, handler HandlerFunc, middleware ...Middl
 	g.addRoute("OPTIONS", pattern, handler, middleware)
 }
 
+// Handle registers a fast-path Context route under the group's prefix. Only
+// the prefix is applied — the group's HandlerFunc Before/After and Middleware
+// cannot wrap a CtxHandler; use CtxMiddleware for fast-path middleware.
+func (g *Group) Handle(method, pattern string, handler CtxHandler, middleware ...CtxMiddleware) {
+	g.app.router.addCtxRoute(strings.ToUpper(method), g.prefix+pattern, handler, middleware)
+}
+
 // addRoute adds a route to the group, attaching group and per-route middleware
 // unless the route's full pattern has been excluded with Skip.
 func (g *Group) addRoute(method, pattern string, handler HandlerFunc, routeMiddleware []Middleware) {
@@ -302,31 +354,101 @@ func (g *Group) addRoute(method, pattern string, handler HandlerFunc, routeMiddl
 
 // ServeHTTP implements the http.Handler interface.
 //
-// All per-request framework state is carried in a single reqState that also
-// serves as the request's context, so the hot path allocates only the
-// reqState itself and the one *http.Request copy r.WithContext requires.
+// The app-level middleware chain is assembled once, on the first request, and
+// reused — earlier versions rebuilt it (allocating a closure per middleware)
+// on every request. Add app middleware before the server starts serving.
 func (app *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	st := newReqState(app, r.Context())
-	r = r.WithContext(st)
+	app.chainOnce.Do(app.buildChain)
+	app.chain.ServeHTTP(w, r)
+}
 
-	// If we have standard middlewares, chain them
-	if len(app.middlewares) > 0 {
-		final := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			app.serveLegacy(w, r)
-		})
+// buildChain assembles dispatch wrapped in the app-level middleware.
+func (app *App) buildChain() {
+	h := http.Handler(http.HandlerFunc(app.dispatch))
+	for i := len(app.middlewares) - 1; i >= 0; i-- {
+		h = app.middlewares[i](h)
+	}
+	app.chain = h
+}
 
-		// Chain middlewares in reverse order
-		handler := http.Handler(final)
-		for i := len(app.middlewares) - 1; i >= 0; i-- {
-			handler = app.middlewares[i](handler)
-		}
-
-		handler.ServeHTTP(w, r)
+// dispatch matches the request to a route and routes it down the fast
+// (Context) path or the standard (HandlerFunc) path. A pooled *Context is used
+// as the scratch space for parameter matching so the match itself allocates
+// nothing.
+func (app *App) dispatch(w http.ResponseWriter, r *http.Request) {
+	tree, ok := app.router.trees[r.Method]
+	if !ok {
+		app.serveNoRoute(w, r)
 		return
 	}
 
-	// Fallback to legacy behavior
-	app.serveLegacy(w, r)
+	c := getContext()
+	rt := tree.searchKV(r.URL.Path, &c.params)
+	if rt == nil {
+		putContext(c)
+		app.serveNoRoute(w, r)
+		return
+	}
+
+	if rt.ctxHandler != nil {
+		// Fast path: the pooled Context is the handler's argument. It carries
+		// no *http.Request copy and is recycled by this goroutine once the
+		// handler returns, so it is safe even under the Timeout middleware.
+		c.init(app, w, r)
+		app.serveCtx(c, rt)
+		return
+	}
+
+	// Standard path: hand the matched parameters to a reqState.
+	app.serveRoute(w, r, rt, c.params)
+	putContext(c)
+}
+
+// serveNoRoute writes the 405 or 404 response for an unmatched request.
+func (app *App) serveNoRoute(w http.ResponseWriter, r *http.Request) {
+	if allowed := app.router.getAllowedMethods(r.URL.Path); len(allowed) > 0 {
+		w.Header().Set("Allow", strings.Join(allowed, ", "))
+		if app.methodNotAllowed != nil {
+			app.methodNotAllowed(w, r)
+		} else {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		}
+		return
+	}
+	if app.notFoundHandler != nil {
+		app.notFoundHandler(w, r)
+	} else {
+		http.NotFound(w, r)
+	}
+}
+
+// serveCtx runs the fast-path pipeline for a Context route.
+func (app *App) serveCtx(c *Context, rt *route) {
+	defer putContext(c)
+	rw, r := &c.resp, c.Request
+
+	for _, handler := range app.before {
+		if err := handler(rw, r); err != nil {
+			app.renderError(rw, r, err, "app.before")
+			return
+		}
+	}
+
+	handler := rt.ctxHandler
+	for i := len(rt.ctxMiddlewares) - 1; i >= 0; i-- {
+		handler = rt.ctxMiddlewares[i](handler)
+	}
+	if err := handler(c); err != nil {
+		app.renderError(rw, r, err, "ctx.handler")
+		return
+	}
+
+	for _, handler := range app.after {
+		if err := handler(rw, r); err != nil {
+			app.renderError(rw, r, err, "app.after")
+			return
+		}
+	}
 }
 
 // renderError turns an error returned by a handler (or before/after handler)
@@ -383,20 +505,16 @@ func (app *App) runRoute(rw *ResponseWriter, r *http.Request, rt *route) error {
 	return handlerErr
 }
 
-// serveLegacy runs the before/route/after handler pipeline. It reuses the
-// pooled ResponseWriter and parameter slice carried by the request's reqState,
-// so it performs no per-request allocation.
-func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
-	st := stateFromRequest(r)
-
-	var rw *ResponseWriter
-	if st != nil {
-		rw = &st.rw
-		rw.initWriter(w)
-	} else {
-		// Defensive: a request that did not pass through ServeHTTP.
-		rw = NewResponseWriter(w)
-	}
+// serveRoute runs the before/route/after pipeline for a standard HandlerFunc
+// route. It builds the per-request reqState here — after the app middleware
+// chain — so the reqState (and the r.WithContext copy) are the only
+// allocations on this path.
+func (app *App) serveRoute(w http.ResponseWriter, r *http.Request, rt *route, params []paramKV) {
+	st := newReqState(app, r.Context())
+	st.params = append(st.params[:0], params...)
+	st.rw.initWriter(w)
+	rw := &st.rw
+	r = r.WithContext(st)
 
 	for _, handler := range app.before {
 		if err := handler(rw, r); err != nil {
@@ -405,63 +523,30 @@ func (app *App) serveLegacy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Use radix tree for O(log n) route matching
-	if tree, ok := app.router.trees[r.Method]; ok {
-		var route *route
-		if st != nil {
-			// Allocation-free: parameters land in the pooled slice.
-			route = tree.searchKV(r.URL.Path, &st.params)
-		} else {
-			route, _ = tree.search(r.URL.Path)
-		}
-		if route != nil {
-			for _, handler := range route.before {
-				if err := handler(rw, r); err != nil {
-					app.renderError(rw, r, err, "route.before")
-					return
-				}
-			}
-
-			if err := app.runRoute(rw, r, route); err != nil {
-				app.renderError(rw, r, err, "route.handler")
-				return
-			}
-
-			for _, handler := range route.after {
-				if err := handler(rw, r); err != nil {
-					app.renderError(rw, r, err, "route.after")
-					return
-				}
-			}
-
-			for _, handler := range app.after {
-				if err := handler(rw, r); err != nil {
-					app.renderError(rw, r, err, "app.after")
-					return
-				}
-			}
+	for _, handler := range rt.before {
+		if err := handler(rw, r); err != nil {
+			app.renderError(rw, r, err, "route.before")
 			return
 		}
 	}
 
-	// Check if route exists for other methods (405 Method Not Allowed)
-	allowedMethods := app.router.getAllowedMethods(r.URL.Path)
-	if len(allowedMethods) > 0 {
-		if app.methodNotAllowed != nil {
-			rw.Header().Set("Allow", strings.Join(allowedMethods, ", "))
-			app.methodNotAllowed(rw, r)
-		} else {
-			rw.Header().Set("Allow", strings.Join(allowedMethods, ", "))
-			http.Error(rw, "Method Not Allowed", http.StatusMethodNotAllowed)
-		}
+	if err := app.runRoute(rw, r, rt); err != nil {
+		app.renderError(rw, r, err, "route.handler")
 		return
 	}
 
-	// No route found - 404
-	if app.notFoundHandler != nil {
-		app.notFoundHandler(rw, r)
-	} else {
-		http.NotFound(rw, r)
+	for _, handler := range rt.after {
+		if err := handler(rw, r); err != nil {
+			app.renderError(rw, r, err, "route.after")
+			return
+		}
+	}
+
+	for _, handler := range app.after {
+		if err := handler(rw, r); err != nil {
+			app.renderError(rw, r, err, "app.after")
+			return
+		}
 	}
 }
 

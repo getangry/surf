@@ -414,6 +414,37 @@ If a handler already wrote the response, the renderer is skipped so the response
 is never corrupted. Return `surf.Abort` to stop processing silently. Override the
 renderer with `surf.NewApp(surf.WithErrorHandler(myRenderer))`.
 
+### Fast-Path Handlers
+
+For the hottest endpoints, `App.Handle` registers a handler that receives a
+pooled `*surf.Context` instead of `(w, r)`. The router copies neither the
+request nor allocates per-request state — about twice as fast as the standard
+path:
+
+```go
+app.Handle("GET", "/users/:id", func(c *surf.Context) error {
+    return c.JSONData(map[string]string{"id": c.Param("id")})
+})
+```
+
+`*Context` provides `Param`, `Query`, `Bind`, `JSON`/`JSONData`/`JSONError`,
+`String`, and more. Compose fast-path middleware with `CtxMiddleware`, and
+resolve typed services with `CtxService[T]`:
+
+```go
+app.Handle("GET", "/me", profile, requireAuthCtx)
+
+func profile(c *surf.Context) error {
+    db, _ := surf.CtxService[*sql.DB](c)
+    _ = db
+    return c.String(http.StatusOK, "ok")
+}
+```
+
+A `*Context` is pooled and recycled when the handler returns — like gin's
+`*Context`, do not retain it (or `c.Request`) in a goroutine that outlives the
+handler. App-level `Use` middleware still wraps fast-path routes.
+
 ### Request Binding & Validation
 
 ```go

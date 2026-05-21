@@ -41,6 +41,18 @@ func surfRouter() http.Handler {
 	return app
 }
 
+// surfFastRouter uses surf's opt-in fast path (App.Handle + *surf.Context).
+func surfFastRouter() http.Handler {
+	app := surf.NewApp()
+	app.Handle("GET", "/", func(c *surf.Context) error {
+		return c.String(http.StatusOK, "ok")
+	})
+	app.Handle("GET", "/users/:id", func(c *surf.Context) error {
+		return c.String(http.StatusOK, c.Param("id"))
+	})
+	return app
+}
+
 func ginRouter() http.Handler {
 	gin.SetMode(gin.ReleaseMode)
 	g := gin.New()
@@ -79,6 +91,7 @@ var frameworks = []struct {
 	build func() http.Handler
 }{
 	{"surf", surfRouter},
+	{"surf-fast", surfFastRouter},
 	{"gin", ginRouter},
 	{"echo", echoRouter},
 	{"chi", chiRouter},

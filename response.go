@@ -3,6 +3,7 @@ package surf
 import (
 	"bufio"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"sync"
@@ -32,12 +33,37 @@ func NewResponseWriter(w http.ResponseWriter) *ResponseWriter {
 	}
 }
 
-// initWriter wires up the zero-valued ResponseWriter embedded in a reqState to
-// wrap w, avoiding a separate ResponseWriter allocation per request.
+// initWriter wires up the zero-valued ResponseWriter embedded in a reqState or
+// Context to wrap w, avoiding a separate ResponseWriter allocation per request.
 func (rw *ResponseWriter) initWriter(w http.ResponseWriter) {
 	rw.ResponseWriter = w
 	rw.status = http.StatusOK
 	rw.startTime = time.Now()
+}
+
+// recycle clears the ResponseWriter so the pooled Context that owns it can be
+// reused by a later request.
+func (rw *ResponseWriter) recycle() {
+	rw.ResponseWriter = nil
+	rw.status = 0
+	rw.size = 0
+	rw.written = false
+	rw.wroteHeader = false
+	if rw.customData != nil {
+		clear(rw.customData)
+	}
+}
+
+// WriteString writes s to the response, tracking size like Write. It lets
+// callers avoid a []byte conversion for string responses.
+func (rw *ResponseWriter) WriteString(s string) (int, error) {
+	if !rw.wroteHeader {
+		rw.WriteHeader(http.StatusOK)
+	}
+	n, err := io.WriteString(rw.ResponseWriter, s)
+	rw.size += n
+	rw.written = true
+	return n, err
 }
 
 // WriteHeader captures the status code and writes the header

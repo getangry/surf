@@ -13,6 +13,11 @@ cosmetic behavior change noted below.
 - **Per-route middleware.** `Get`/`Post`/`Put`/`Delete`/`Patch`/`Head`/`Options`
   on both `App` and `Group` accept optional trailing `...Middleware`, applied to
   that route only.
+- **Fast-path handlers.** `App.Handle` / `Group.Handle` register a handler that
+  receives a pooled `*Context` (`func(c *Context) error`) instead of `(w, r)`.
+  The router copies neither the request nor allocates per-request state.
+  `CtxMiddleware` composes fast-path middleware; `CtxService[T]` resolves typed
+  services. Use it for the hottest endpoints.
 - **Per-group middleware.** `Group.Use(...Middleware)` applies standard
   middleware to every route in a group; `Group.Skip(patterns...)` excludes
   specific routes from the group's `Before`, `After`, and `Use` middleware.
@@ -52,13 +57,18 @@ cosmetic behavior change noted below.
   map on every request. All per-request state now lives in a single `reqState`
   that also serves as the request context, parameters are resolved into an
   inline buffer, and the `customData` map is allocated lazily.
-- Result on an isolated param-route benchmark: **416 ns/op → 150 ns/op and
-  14 allocs/op → 3** (the two framework allocations are the `reqState` and the
-  `r.WithContext` request copy). surf now outperforms chi; gin and echo remain
-  faster because their handler signature receives a pooled context object
-  directly, avoiding the request copy entirely.
+- Result on an isolated param-route benchmark: the standard `func(w, r)` path
+  went from **416 ns/op, 14 allocs/op** to **~160 ns/op, 3 allocs/op** (the
+  framework allocations are the `reqState` and the `r.WithContext` request
+  copy).
+- The opt-in fast path (`App.Handle`, `*Context`) avoids the request copy and
+  pools all per-request state: **~98 ns/op, 2 allocs/op** — roughly twice as
+  fast as chi on the same benchmark. gin and echo (~55 ns/op) remain ahead
+  because their handler-receives-context model is mandatory rather than opt-in.
+- The app middleware chain is now assembled once instead of being rebuilt (with
+  a closure allocation per middleware) on every request.
 - A `benchmarks/` module (separate, so surf stays dependency-free) compares
-  surf against gin, echo, chi, and `net/http.ServeMux`.
+  surf — both paths — against gin, echo, chi, and `net/http.ServeMux`.
 
 ### Changed
 

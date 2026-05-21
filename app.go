@@ -47,6 +47,8 @@ type App struct {
 	notFoundHandler  http.HandlerFunc
 	methodNotAllowed http.HandlerFunc
 	errorHandler     ErrorRenderer
+	chain            http.Handler
+	chainOnce        sync.Once
 }
 
 // NewApp initializes a new Surf application instance with context and signal handling.
