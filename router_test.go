@@ -3,6 +3,7 @@ package surf
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -36,7 +37,7 @@ func TestRouterBasicRoutes(t *testing.T) {
 		{"GET users", "GET", "/users", http.StatusOK, "users"},
 		{"POST users", "POST", "/users", http.StatusCreated, "created"},
 		{"GET not found", "GET", "/notfound", http.StatusNotFound, "404 page not found\n"},
-		{"wrong method", "DELETE", "/users", http.StatusNotFound, "404 page not found\n"},
+		{"wrong method", "DELETE", "/users", http.StatusMethodNotAllowed, "Method Not Allowed\n"},
 	}
 
 	for _, tt := range tests {
@@ -292,9 +293,13 @@ func TestRouterHandlerError(t *testing.T) {
 		t.Errorf("status = %d, want %d", rec.Code, http.StatusInternalServerError)
 	}
 
-	// Should NOT contain the actual error message (security)
-	if rec.Body.String() != "Internal Server Error\n" {
-		t.Errorf("body = %q, want generic error", rec.Body.String())
+	// Should NOT contain the actual error message (security): the default
+	// renderer emits a generic JSON envelope.
+	if got := rec.Body.String(); !strings.Contains(got, `"error":"Internal Server Error"`) {
+		t.Errorf("body = %q, want generic JSON error envelope", got)
+	}
+	if strings.Contains(rec.Body.String(), "ErrBodyNotAllowed") {
+		t.Errorf("body leaked internal error detail: %q", rec.Body.String())
 	}
 }
 
@@ -385,7 +390,7 @@ func TestAllHTTPMethods(t *testing.T) {
 	app := NewApp()
 
 	methods := []struct {
-		register func(string, HandlerFunc)
+		register func(string, HandlerFunc, ...Middleware)
 		method   string
 	}{
 		{app.Get, "GET"},

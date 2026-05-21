@@ -143,11 +143,11 @@ func GetUserID(r *http.Request) string {
 // Returns zero value if service not found or type assertion fails
 func GetService[T any](r *http.Request, key any) T {
 	var zero T
-	app, ok := r.Context().Value(appKey{}).(*App)
-	if !ok {
+	st := stateFromRequest(r)
+	if st == nil || st.app == nil {
 		return zero
 	}
-	service := app.GetService(key)
+	service := st.app.GetService(key)
 	if service == nil {
 		return zero
 	}
@@ -483,6 +483,52 @@ func LoggingMiddleware(format string) Middleware {
 	}
 }
 
+// LoggingConfig configures LoggingMiddlewareWithConfig.
+type LoggingConfig struct {
+	// Format is the log template (e.g. "{method} {path} {status}"). When
+	// empty, a sensible default is used.
+	Format string
+
+	// SkipPaths lists request paths excluded from logging. A path ending in
+	// "*" matches by prefix (e.g. "/health/*"); others match exactly. Skipped
+	// requests still have their global request storage cleaned up.
+	SkipPaths []string
+}
+
+// LoggingMiddlewareWithConfig creates a logging middleware that can exclude
+// paths (such as health probes) from the log via SkipPaths.
+func LoggingMiddlewareWithConfig(config LoggingConfig) Middleware {
+	format := config.Format
+	if format == "" {
+		format = "{method} {path} {status} {latency_ms}ms"
+	}
+	skip := config.SkipPaths
+
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Always clean up request storage, even for skipped paths.
+			defer Delete(r)
+
+			if matchAnyGlob(r.URL.Path, skip) {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			rw := NewResponseWriter(w)
+			next.ServeHTTP(rw, r)
+
+			entry := &LogEntry{
+				req:     r,
+				status:  rw.Status(),
+				size:    rw.Size(),
+				latency: rw.Latency(),
+				rw:      rw,
+			}
+			slog.Info(formatLog(format, entry))
+		})
+	}
+}
+
 // Logger creates a standard HTTP middleware for logging
 func Logger(format string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
@@ -594,23 +640,23 @@ func generateRequestID(prefix string) string {
 
 // RequestLoggerOptions configures the RequestLogger middleware behavior
 type RequestLoggerOptions struct {
-	Logger           *slog.Logger
-	Level            slog.Level
-	IncludeReqHeaders bool
+	Logger             *slog.Logger
+	Level              slog.Level
+	IncludeReqHeaders  bool
 	IncludeRespHeaders bool
-	HeaderFilter     func(key string) bool // Optional filter to include/exclude specific headers
-	GroupHeaders     bool                   // Group headers under "request_headers" and "response_headers"
+	HeaderFilter       func(key string) bool // Optional filter to include/exclude specific headers
+	GroupHeaders       bool                  // Group headers under "request_headers" and "response_headers"
 }
 
 // DefaultRequestLoggerOptions returns default options for RequestLogger
 func DefaultRequestLoggerOptions() *RequestLoggerOptions {
 	return &RequestLoggerOptions{
-		Logger:           slog.Default(),
-		Level:            slog.LevelInfo,
-		IncludeReqHeaders: false,
+		Logger:             slog.Default(),
+		Level:              slog.LevelInfo,
+		IncludeReqHeaders:  false,
 		IncludeRespHeaders: false,
-		GroupHeaders:     true,
-		HeaderFilter:     nil, // Include all headers by default
+		GroupHeaders:       true,
+		HeaderFilter:       nil, // Include all headers by default
 	}
 }
 

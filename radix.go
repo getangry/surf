@@ -236,6 +236,67 @@ func (t *radixTree) searchNode(node *radixNode, path string, params map[string]s
 	return nil
 }
 
+// searchKV is the allocation-free variant of search used on the hot path. It
+// resets *params and appends each matched parameter to it, reusing the slice's
+// backing array across requests.
+func (t *radixTree) searchKV(path string, params *[]paramKV) *route {
+	if path == "" {
+		path = "/"
+	}
+	*params = (*params)[:0]
+	return t.searchNodeKV(t.root, path, params)
+}
+
+// searchNodeKV mirrors searchNode but records parameters in a slice. On a
+// failed branch it truncates the slice back to the pre-branch length.
+func (t *radixTree) searchNodeKV(node *radixNode, path string, params *[]paramKV) *route {
+	if len(path) == 0 {
+		return node.handler
+	}
+
+	// Static children first (most specific).
+	for _, child := range node.children {
+		if child.nodeType == staticNode && strings.HasPrefix(path, child.path) {
+			if r := t.searchNodeKV(child, path[len(child.path):], params); r != nil {
+				return r
+			}
+		}
+	}
+
+	// Parameter children.
+	for _, child := range node.children {
+		if child.nodeType != paramNode {
+			continue
+		}
+		end := strings.IndexByte(path, '/')
+		var value, remaining string
+		if end == -1 {
+			value, remaining = path, ""
+		} else {
+			value, remaining = path[:end], path[end:]
+		}
+		if value == "" {
+			continue
+		}
+		mark := len(*params)
+		*params = append(*params, paramKV{key: child.paramKey, val: value})
+		if r := t.searchNodeKV(child, remaining, params); r != nil {
+			return r
+		}
+		*params = (*params)[:mark]
+	}
+
+	// Wildcard children last.
+	for _, child := range node.children {
+		if child.nodeType == wildcardNode {
+			*params = append(*params, paramKV{key: "*", val: path})
+			return child.handler
+		}
+	}
+
+	return nil
+}
+
 // longestCommonPrefix finds the longest common prefix between two strings
 func longestCommonPrefix(a, b string) int {
 	max := len(a)
