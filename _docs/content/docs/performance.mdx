@@ -1,0 +1,131 @@
+---
+title: Performance
+description: Benchmarks, profile findings, and the optimization roadmap
+---
+
+# Performance
+
+Surf is **fast enough to compete with chi** on its standard path and
+**competitive with `net/http.ServeMux`** on its opt-in fast path. gin and
+echo remain ahead — see the roadmap below for how that gap is closed.
+
+## Cross-framework benchmark
+
+Isolated param-route benchmark (`benchmarks/`, Apple Silicon, Go 1.26):
+
+| Router | ns/op | allocs/op | bytes/op |
+|---|---|---|---|
+| `net/http.ServeMux` | 80 | 2 | 24 |
+| **gin** | **55** | **1** | 48 |
+| **echo** | **57** | **1** | 8 |
+| chi | 196 | 5 | 712 |
+| surf (standard path) | ~160 | 3 | 744 |
+| **surf (fast path)** | **~100** | **2** | 24 |
+
+surf's fast path is **~2× faster than chi** and in `ServeMux` territory. The
+standard path is **~2.6× faster** than the pre-v0.1.0 surf (416 ns / 14
+allocs) — the headline of the v0.1.0 release.
+
+Reproduce locally:
+
+```sh
+cd benchmarks
+go test -bench=. -benchmem -run='^$'
+
+# For just one row, with more samples:
+go test -bench='BenchmarkParamRoute/surf-fast' -benchtime=4s -benchmem -run='^$'
+```
+
+The `benchmarks/` module is intentionally separate so the surf module itself
+has no third-party dependencies.
+
+## What v0.1.0 changed
+
+Before v0.1.0, every request paid for:
+
+- Three separate `context.WithValue` calls (App, ResponseWriter, each path
+  parameter) — each is one context-node alloc plus one `r.WithContext` request
+  copy
+- An eagerly-allocated `customData` map
+- A fresh `params` map from every radix search
+
+The hot path now uses a single `reqState` that *is* the request context —
+attached with one `r.WithContext` call. Parameters resolve into an inline
+buffer via an allocation-free radix search; `customData` is allocated lazily.
+
+Result on the param-route benchmark: **416 ns/op → ~160 ns/op, 14 allocs/op
+→ 3.**
+
+## The fast path
+
+`App.Handle` adds an opt-in handler signature that bypasses the request copy
+entirely. See [Context (Fast Path)](/docs/context) for the API.
+
+```go
+app.Handle("GET", "/users/:id", func(c *surf.Context) error {
+    return c.JSONData(map[string]string{"id": c.Param("id")})
+})
+```
+
+- No `r.WithContext` allocation — the `*Context` *is* the per-request state.
+- The Context is pooled with `sync.Pool` and released by the handler's own
+  goroutine in a `defer`, so it is safe even under the `Timeout` middleware
+  (which detaches the handler into a goroutine that outlives `ServeHTTP`).
+
+## Roadmap to closing the gin/echo gap
+
+CPU profiling of `surf-fast` on Apple Silicon attributes the remaining ~45 ns
+gap as follows:
+
+| Cost | % of request | Source |
+|---|---|---|
+| `time.Now()` | **~25%** | `ResponseWriter.initWriter` sets `startTime` on every request |
+| `Context.String` | ~23% | `io.WriteString` `[]byte` conversion + header canonicalization |
+| radix `searchNodeKV` | ~9% | recursive walk, per-node child-type scan |
+| `sync.Pool.Get` | ~2.5% | Context checkout — largely irreducible |
+
+> **Platform caveat.** On macOS `time.Now()` is significantly more expensive
+> than on Linux (vDSO). The ranking holds, but the absolute percentages will
+> shift on production hardware — re-profile there before committing.
+
+Planned for **v0.1.1**, none requiring an API change:
+
+1. **Drop `time.Now()` from the hot path** — ~25%, trivial. `startTime` only
+   exists for `Latency()` / template logging; make it lazy or have logging
+   middleware own timing. This single change moves the fast path into stdlib
+   `ServeMux` territory.
+2. **Canonical-key-free header writes** — ~3%. Avoid
+   `CanonicalMIMEHeaderKey` for known response headers.
+3. **Allocation-free string responses** — ~9%. Avoid the `[]byte` conversion
+   in `io.WriteString` when the underlying writer isn't a `io.StringWriter`.
+4. **Iterative radix lookup** — ~9% → ~4%. Replace the recursive walk with an
+   iterative one using separated child slices.
+
+Items 1+2+4 together project the fast path from ~100 ns to ~65–75 ns —
+competitive with gin and echo. See `PERFORMANCE.md` in the repository for the
+full plan and the profile this is based on.
+
+## When framework speed matters
+
+For an HTTP framework benchmark, the difference between 55 ns and 100 ns is
+seductive in microbenchmarks and **disappears in real applications** the
+moment the handler does anything (a database query, a template render, a
+serialization pass). The honest cases where these few-dozen-nanosecond
+differences add up:
+
+- High-QPS health/lookup endpoints (use the [fast path](/docs/context)).
+- Pure routing nodes (load balancer / API gateway shaped workloads).
+- Telemetry ingest where every request is one cheap write.
+
+For everything else, optimize the handler first.
+
+## Next Steps
+
+<Cards>
+  <Card title="Context (Fast Path)" href="/docs/context">
+    The pooled `*Context` handler model
+  </Card>
+  <Card title="Metrics" href="/docs/metrics">
+    Measure your own request distribution
+  </Card>
+</Cards>

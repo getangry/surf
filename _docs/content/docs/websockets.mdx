@@ -1,0 +1,150 @@
+---
+title: WebSockets
+description: RFC 6455 upgrade with same-origin policy by default
+---
+
+# WebSockets
+
+`surf.Upgrade` performs the RFC 6455 handshake and returns a `*WSConn`. The
+implementation supports text/binary messages, fragmentation, and answers ping
+frames automatically. It has no third-party dependencies.
+
+## Security: same-origin by default
+
+`Upgrade` enforces a same-origin policy by default: a handshake is rejected
+with **403** unless the `Origin` header is absent (non-browser client) or its
+host matches the request `Host`.
+
+WebSocket connections bypass the Same-Origin Policy and CORS does not apply to
+them, yet browsers attach cookies to cross-origin handshakes. Without this
+default, any cookie-authenticated WebSocket endpoint would be open to
+**cross-site WebSocket hijacking** (CSWSH).
+
+To accept cross-origin clients, use `UpgradeWithConfig`:
+
+```go
+conn, err := surf.UpgradeWithConfig(w, r, surf.UpgradeConfig{
+    CheckOrigin: surf.AllowOrigins("https://app.example.com"),
+})
+```
+
+`SameOriginCheck` (the exported default) and `AllowOrigins(origins ...)` are
+the building blocks. You can also supply your own function:
+
+```go
+cfg := surf.UpgradeConfig{
+    CheckOrigin: func(r *http.Request) bool {
+        return strings.HasSuffix(r.Header.Get("Origin"), ".example.com")
+    },
+}
+```
+
+## Echo server
+
+```go
+app.Get("/ws", func(w http.ResponseWriter, r *http.Request) error {
+    conn, err := surf.Upgrade(w, r) // same-origin only
+    if err != nil {
+        return err // 400 if not a WS upgrade, 403 if origin rejected
+    }
+    defer conn.Close()
+
+    for {
+        mt, data, err := conn.ReadMessage()
+        if err != nil {
+            return surf.Abort // ErrWebSocketClosed or network error
+        }
+        if err := conn.WriteMessage(mt, data); err != nil {
+            return surf.Abort
+        }
+    }
+})
+```
+
+A failed upgrade returns an `*HTTPError`:
+
+- **400** — the request is not a valid WebSocket upgrade
+- **403** — the request was rejected by `CheckOrigin`
+
+In both cases the connection is **not** hijacked, so a handler can simply
+`return err` and let the error renderer respond.
+
+## Connection API
+
+```go
+type WSConn
+
+// Read the next complete message. Returns ErrWebSocketClosed when the peer
+// closes the connection. Ping frames are automatically answered with pong;
+// fragmented messages are reassembled.
+func (c *WSConn) ReadMessage() (messageType int, payload []byte, err error)
+
+// Send a complete, unfragmented message. messageType must be TextMessage
+// or BinaryMessage.
+func (c *WSConn) WriteMessage(messageType int, data []byte) error
+func (c *WSConn) WriteText(s string) error
+func (c *WSConn) WriteBinary(data []byte) error
+
+// Optional. Defaults to 8 MiB.
+func (c *WSConn) SetMaxMessageSize(n int64)
+
+// Sends a close frame and closes the underlying connection.
+func (c *WSConn) Close() error
+```
+
+Message-type constants:
+
+```go
+const (
+    TextMessage   = 0x1
+    BinaryMessage = 0x2
+)
+```
+
+`ErrWebSocketClosed` is the sentinel returned from `ReadMessage` once the
+peer has sent a close frame.
+
+## Concurrency
+
+A `WSConn` is safe for **one reader and one writer goroutine** (writes are
+serialized by an internal mutex). The typical pattern is one goroutine in
+`ReadMessage`, another emitting messages from a channel.
+
+## Detecting upgrades
+
+`IsWebSocketUpgrade(r)` is useful when a handler accepts both regular HTTP
+and WebSocket traffic:
+
+```go
+app.Get("/stream", func(w http.ResponseWriter, r *http.Request) error {
+    if surf.IsWebSocketUpgrade(r) {
+        conn, err := surf.Upgrade(w, r)
+        if err != nil {
+            return err
+        }
+        return streamOverWS(conn)
+    }
+    return streamOverSSE(w, r)
+})
+```
+
+## Limitations
+
+- Single-connection helper, not a full library. Per-message-deflate,
+  subprotocol negotiation, and HTTP/2 WebSockets are not implemented.
+- Outbound messages are always sent as a single, final, unmasked frame. The
+  reader handles fragmented inbound messages.
+- For a fuller-featured library, `nhooyr.io/websocket` or
+  `github.com/gorilla/websocket` are the standard choices; surf interoperates
+  fine alongside either.
+
+## Next Steps
+
+<Cards>
+  <Card title="Error Handling" href="/docs/error-handling">
+    How `Upgrade`'s 400/403 errors flow to the client
+  </Card>
+  <Card title="Metrics" href="/docs/metrics">
+    Track WebSocket request counts and latencies
+  </Card>
+</Cards>

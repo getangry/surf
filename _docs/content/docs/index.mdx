@@ -5,22 +5,36 @@ description: A lightweight, high-performance HTTP web framework for Go
 
 # Welcome to Surf
 
-Surf is a lightweight, high-performance HTTP web framework for Go. It provides a clean API for building web applications with features like radix tree routing, built-in middleware, and structured logging.
+Surf is a lightweight, high-performance HTTP web framework for Go. Radix-tree
+routing, two handler models (stdlib-compatible and a pooled fast path), a small
+standard middleware suite, and zero third-party dependencies.
 
 ## Features
 
 <Cards>
   <Card title="Fast Routing" icon="zap">
-    Radix tree-based router with O(log n) route matching - 73x faster than linear search.
+    Radix-tree router with O(log n) matching — competitive with chi and gin/echo.
   </Card>
-  <Card title="Built-in Middleware" icon="layers">
-    CORS, Recovery, Rate Limiting, Timeout, and Gzip compression out of the box.
+  <Card title="Two Handler Models" icon="layers">
+    Standard `func(w, r) error` for the stdlib ecosystem; opt-in `func(c *Context) error` for the hottest endpoints.
   </Card>
-  <Card title="Static Files" icon="folder">
-    Serve directories and individual static files with directory traversal protection.
+  <Card title="Errors as Responses" icon="alert-triangle">
+    Return an `*HTTPError` and surf renders a JSON envelope; `Abort` stops silently; pre-written responses are preserved.
   </Card>
-  <Card title="Structured Logging" icon="file-text">
-    Built-in slog integration with template-based and structured logging options.
+  <Card title="Typed Services" icon="package">
+    `Provide[T]` / `Service[T]` — type-keyed DI with no silent zero-value bugs.
+  </Card>
+  <Card title="Body Binding" icon="file-input">
+    `Bind` / `BindAndValidate` with size limits and a `Validator` hook.
+  </Card>
+  <Card title="WebSockets" icon="radio">
+    RFC 6455 `Upgrade` with same-origin policy by default.
+  </Card>
+  <Card title="SPA Serving" icon="folder">
+    `App.SPA` over any `fs.FS` (incl. `embed.FS`), with immutable asset caching.
+  </Card>
+  <Card title="Metrics" icon="bar-chart">
+    Dependency-free Prometheus exposition middleware.
   </Card>
 </Cards>
 
@@ -30,37 +44,41 @@ Surf is a lightweight, high-performance HTTP web framework for Go. It provides a
 package main
 
 import (
-    "encoding/json"
     "net/http"
+
     "github.com/getangry/surf"
 )
 
 func main() {
     app := surf.NewApp()
 
-    // Add middleware
     app.Use(surf.RecoveryWithDefaults())
     app.Use(surf.CORSWithDefaults())
 
-    // Define routes
+    // Standard handler — stdlib-compatible
     app.Get("/hello/:name", func(w http.ResponseWriter, r *http.Request) error {
-        name := surf.Param(r, "name")
-        return json.NewEncoder(w).Encode(map[string]string{
-            "message": "Hello, " + name + "!",
+        return surf.JSONData(w, map[string]string{
+            "message": "Hello, " + surf.Param(r, "name") + "!",
         })
     })
 
-    // Start server
+    // Fast-path handler — pooled *Context, ~zero framework allocations
+    app.Handle("GET", "/healthz", func(c *surf.Context) error {
+        return c.String(http.StatusOK, "ok")
+    })
+
     app.Serve()
 }
 ```
 
 ## Why Surf?
 
-- **Simple**: Clean, intuitive API that feels natural to Go developers
-- **Fast**: Radix tree routing provides excellent performance at scale
-- **Safe**: Thread-safe design with proper mutex handling
-- **Complete**: Everything you need for production web apps included
+- **Simple** — clean API that reads like idiomatic `net/http`.
+- **Fast** — competitive with chi (standard path) and approaching gin/echo
+  (fast path). See [Performance](/docs/performance).
+- **Safe by default** — generic 500 for unhandled errors (no detail leak),
+  same-origin WebSocket upgrades, body-size limits on JSON binding.
+- **Additive** — features evolve without breaking existing callers.
 
 ## Next Steps
 
@@ -72,6 +90,9 @@ func main() {
     Build your first Surf application
   </Card>
   <Card title="Routing" href="/docs/routing">
-    Learn about path parameters and route groups
+    Path parameters, route groups, per-route middleware
+  </Card>
+  <Card title="Context (Fast Path)" href="/docs/context">
+    The pooled `*Context` handler model
   </Card>
 </Cards>
