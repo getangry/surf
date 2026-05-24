@@ -58,6 +58,7 @@ app := surf.NewApp(
 | `WithContext(ctx)` | Custom base context |
 | `WithShutdownChannel(ch)` | Custom shutdown signal channel |
 | `WithCancelFunc(cancel)` | Custom context cancel function |
+| `WithErrorHandler(fn)` | Custom renderer for errors returned by handlers (default: `DefaultErrorRenderer`) |
 
 ### Option Type
 
@@ -380,6 +381,224 @@ app.Get("/users/:id", func(w http.ResponseWriter, r *http.Request) error {
     requestID := surf.GetRequestID(r)
     return nil
 })
+```
+
+---
+
+## v0.1.0 APIs
+
+The v0.1.0 release added several new APIs. Each has its own dedicated page;
+this section is the type-and-signature reference.
+
+### Per-route and per-group middleware
+
+```go
+// Variadic ...Middleware on every route method.
+func (app *App) Get(pattern string, handler HandlerFunc, middleware ...Middleware)
+// Post, Put, Delete, Patch, Head, Options identical.
+
+// Group-wide middleware and route-exclusion.
+func (g *Group) Use(middleware ...Middleware) *Group
+func (g *Group) Skip(patterns ...string) *Group
+```
+
+See: [Routing](/docs/routing), [Middleware](/docs/middleware).
+
+### Fast path (Context)
+
+```go
+type CtxHandler   func(c *Context) error
+type CtxMiddleware func(next CtxHandler) CtxHandler
+
+func (app *App)  Handle(method, pattern string, handler CtxHandler, middleware ...CtxMiddleware)
+func (g *Group)  Handle(method, pattern string, handler CtxHandler, middleware ...CtxMiddleware)
+
+type Context struct {
+    Request *http.Request
+    // unexported fields
+}
+
+func (c *Context) Writer() *ResponseWriter
+func (c *Context) Method() string
+func (c *Context) Path() string
+func (c *Context) Param(key string) string
+func (c *Context) Query(key string) string
+func (c *Context) Header(key string) string
+func (c *Context) SetHeader(key, value string)
+func (c *Context) Status() int
+func (c *Context) Context() context.Context
+
+func (c *Context) Bind(v any) error
+func (c *Context) BindAndValidate(v any) error
+func (c *Context) JSON(status int, v any) error
+func (c *Context) JSONData(v any) error
+func (c *Context) JSONError(status int, message string) error
+func (c *Context) String(status int, s string) error
+func (c *Context) NoContent(status int) error
+```
+
+See: [Context (Fast Path)](/docs/context).
+
+### Error handling
+
+```go
+var Abort = errors.New("surf: handler aborted")
+
+type HTTPError struct {
+    Code    int
+    Message string
+    Err     error
+}
+func NewHTTPError(code int, message string) *HTTPError
+func Errorf(code int, message string, cause error) *HTTPError
+func (e *HTTPError) Error() string
+func (e *HTTPError) Unwrap() error
+
+type ErrorRenderer func(w http.ResponseWriter, r *http.Request, err error)
+func DefaultErrorRenderer(w http.ResponseWriter, r *http.Request, err error)
+func WithErrorHandler(renderer ErrorRenderer) Option
+```
+
+See: [Error Handling](/docs/error-handling).
+
+### JSON response envelopes
+
+```go
+func JSON(w http.ResponseWriter, status int, v any) error
+func JSONData(w http.ResponseWriter, v any) error
+func JSONDataStatus(w http.ResponseWriter, status int, v any) error
+func JSONList(w http.ResponseWriter, items any, total int) error
+func JSONError(w http.ResponseWriter, status int, message string) error
+```
+
+See: [Helpers](/docs/helpers).
+
+### Body binding
+
+```go
+const DefaultMaxBodyBytes int64 = 1 << 20
+
+type Validator interface { Validate() error }
+
+func Bind(r *http.Request, v any) error
+func BindWithLimit(r *http.Request, v any, maxBytes int64) error
+func BindAndValidate(r *http.Request, v any) error
+```
+
+See: [Helpers](/docs/helpers).
+
+### Typed services
+
+```go
+func Provide[T any](app *App, service T)
+func Service[T any](r *http.Request) (T, bool)
+func MustService[T any](r *http.Request) T
+func CtxService[T any](c *Context) (T, bool)
+```
+
+See: [Services](/docs/services).
+
+### SPA serving
+
+```go
+type SPAConfig struct {
+    Prefix            string
+    FS                fs.FS
+    Index             string   // default "index.html"
+    ImmutablePrefixes []string // default ["assets"]
+    ExcludePrefixes   []string
+}
+
+func (app *App) SPA(prefix string, fsys fs.FS)
+func (app *App) SPAWithConfig(config SPAConfig)
+```
+
+See: [Static Files](/docs/static-files).
+
+### Metrics
+
+```go
+type MetricsRegistry struct { /* ... */ }
+
+func NewMetricsRegistry() *MetricsRegistry
+func NewMetricsRegistryWithBuckets(buckets []float64) *MetricsRegistry
+
+func (m *MetricsRegistry) Middleware() Middleware
+func (m *MetricsRegistry) Handler() HandlerFunc
+```
+
+See: [Metrics](/docs/metrics).
+
+### WebSockets
+
+```go
+const (
+    TextMessage   = 0x1
+    BinaryMessage = 0x2
+)
+var ErrWebSocketClosed = errors.New("surf: websocket closed by peer")
+
+type UpgradeConfig struct {
+    CheckOrigin func(r *http.Request) bool
+}
+
+func IsWebSocketUpgrade(r *http.Request) bool
+func SameOriginCheck(r *http.Request) bool
+func AllowOrigins(origins ...string) func(*http.Request) bool
+
+func Upgrade(w http.ResponseWriter, r *http.Request) (*WSConn, error)
+func UpgradeWithConfig(w http.ResponseWriter, r *http.Request, config UpgradeConfig) (*WSConn, error)
+
+type WSConn struct { /* ... */ }
+func (c *WSConn) ReadMessage()  (messageType int, payload []byte, err error)
+func (c *WSConn) WriteMessage(messageType int, data []byte) error
+func (c *WSConn) WriteText(s string) error
+func (c *WSConn) WriteBinary(data []byte) error
+func (c *WSConn) SetMaxMessageSize(n int64)
+func (c *WSConn) Close() error
+```
+
+See: [WebSockets](/docs/websockets).
+
+### Client IP / proxy-aware rate limiting
+
+```go
+func IPFromRequest(r *http.Request, trustedProxies []string) string
+func KeyByIP(trustedProxies ...string) func(r *http.Request) string
+
+// RateLimitConfig gained a TrustedProxies field — when KeyFunc is nil and
+// TrustedProxies is non-empty, the default key uses IPFromRequest.
+type RateLimitConfig struct {
+    RequestsPerSecond float64
+    Burst             int
+    KeyFunc           func(r *http.Request) string
+    TrustedProxies    []string
+    ExceededHandler   func(w http.ResponseWriter, r *http.Request)
+    SkipFunc          func(r *http.Request) bool
+}
+```
+
+See: [Middleware](/docs/middleware), [Helpers](/docs/helpers).
+
+### Logging with path filters
+
+```go
+type LoggingConfig struct {
+    Format    string   // e.g. "{method} {path} {status} {latency_ms}ms"
+    SkipPaths []string // exact paths or trailing-"*" prefixes (e.g. "/health/*")
+}
+
+func LoggingMiddlewareWithConfig(config LoggingConfig) Middleware
+```
+
+See: [Middleware](/docs/middleware).
+
+### ResponseWriter additions
+
+```go
+// Write a string without the []byte conversion when the underlying writer
+// supports io.StringWriter.
+func (rw *ResponseWriter) WriteString(s string) (int, error)
 ```
 
 ---
