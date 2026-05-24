@@ -207,3 +207,117 @@ func TestHandleAndLegacyCoexist(t *testing.T) {
 		}
 	}
 }
+
+func TestContextCookies(t *testing.T) {
+	app := NewApp()
+	var seen string
+	app.Handle("GET", "/x", func(c *Context) error {
+		seen = c.Cookie("session")
+		return c.NoContent(http.StatusOK)
+	})
+
+	r := httptest.NewRequest("GET", "/x", nil)
+	r.Header.Set("Cookie", "session=abc123; user=ada")
+	app.ServeHTTP(httptest.NewRecorder(), r)
+
+	if seen != "abc123" {
+		t.Errorf("Cookie(session) = %q, want abc123", seen)
+	}
+}
+
+func TestContextCookiesList(t *testing.T) {
+	app := NewApp()
+	var names []string
+	app.Handle("GET", "/x", func(c *Context) error {
+		for _, ck := range c.Cookies() {
+			names = append(names, ck.Name)
+		}
+		return c.NoContent(http.StatusOK)
+	})
+
+	r := httptest.NewRequest("GET", "/x", nil)
+	r.Header.Set("Cookie", "session=abc; user=ada")
+	app.ServeHTTP(httptest.NewRecorder(), r)
+
+	if len(names) != 2 || names[0] != "session" || names[1] != "user" {
+		t.Errorf("cookie names = %v, want [session user]", names)
+	}
+}
+
+func TestContextCookieMissing(t *testing.T) {
+	app := NewApp()
+	var got string
+	app.Handle("GET", "/x", func(c *Context) error {
+		got = c.Cookie("nope")
+		return c.NoContent(http.StatusOK)
+	})
+
+	app.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x", nil))
+	if got != "" {
+		t.Errorf("missing cookie = %q, want empty", got)
+	}
+}
+
+func TestContextQueryValues(t *testing.T) {
+	app := NewApp()
+	var page, sort string
+	var tags []string
+	app.Handle("GET", "/x", func(c *Context) error {
+		q := c.QueryValues()
+		page = q.Get("page")
+		sort = q.Get("sort")
+		tags = q["tag"]
+		return c.NoContent(http.StatusOK)
+	})
+
+	app.ServeHTTP(httptest.NewRecorder(),
+		httptest.NewRequest("GET", "/x?page=2&sort=desc&tag=go&tag=http", nil))
+
+	if page != "2" || sort != "desc" || len(tags) != 2 {
+		t.Errorf("got page=%q sort=%q tags=%v", page, sort, tags)
+	}
+}
+
+func TestContextQueryUsesCache(t *testing.T) {
+	// Repeated c.Query calls must hit the same parsed map as c.QueryValues.
+	app := NewApp()
+	var first, second, third string
+	app.Handle("GET", "/x", func(c *Context) error {
+		first = c.Query("a")
+		second = c.QueryValues().Get("a")
+		third = c.Query("a")
+		return c.NoContent(http.StatusOK)
+	})
+	app.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest("GET", "/x?a=1", nil))
+	if first != "1" || second != "1" || third != "1" {
+		t.Errorf("got %q %q %q", first, second, third)
+	}
+}
+
+func TestContextLazyResetAcrossPool(t *testing.T) {
+	// Simulate two requests cycling through the pool. The second must not
+	// observe the first request's cookies/query.
+	c := getContext()
+	r1 := httptest.NewRequest("GET", "/?a=1", nil)
+	r1.Header.Set("Cookie", "x=1")
+	c.init(nil, httptest.NewRecorder(), r1)
+	if c.Cookie("x") != "1" || c.Query("a") != "1" {
+		t.Fatalf("first request: cookie=%q query=%q", c.Cookie("x"), c.Query("a"))
+	}
+	putContext(c)
+
+	// Pool may return the same object; if so the lazy state must be reset.
+	c2 := getContext()
+	r2 := httptest.NewRequest("GET", "/?b=2", nil) // no Cookie header, different query
+	c2.init(nil, httptest.NewRecorder(), r2)
+	if got := c2.Cookie("x"); got != "" {
+		t.Errorf("second request leaked cookie x=%q", got)
+	}
+	if got := c2.Query("a"); got != "" {
+		t.Errorf("second request leaked query a=%q", got)
+	}
+	if got := c2.Query("b"); got != "2" {
+		t.Errorf("second request fresh query b=%q, want 2", got)
+	}
+	putContext(c2)
+}
