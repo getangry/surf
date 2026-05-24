@@ -340,7 +340,7 @@ func RateLimit(config RateLimitConfig) Middleware {
 				if config.ExceededHandler != nil {
 					config.ExceededHandler(w, r)
 				} else {
-					w.Header().Set("Retry-After", "1")
+					setKnownHeader(w.Header(), headerRetryAfter, "1")
 					http.Error(w, "Too Many Requests", http.StatusTooManyRequests)
 				}
 				return
@@ -527,7 +527,7 @@ func Gzip(config GzipConfig) Middleware {
 			defer gz.Close()
 
 			// Set Vary header
-			w.Header().Set("Vary", "Accept-Encoding")
+			setKnownHeader(w.Header(), headerVary, "Accept-Encoding")
 
 			next.ServeHTTP(gz, r)
 		})
@@ -572,8 +572,8 @@ func (gz *gzipResponseWriter) Close() error {
 	}
 
 	if shouldCompress {
-		gz.Header().Set("Content-Encoding", "gzip")
-		gz.Header().Del("Content-Length")
+		setKnownHeader(gz.Header(), headerContentEncoding, "gzip")
+		gz.Header().Del(headerContentLength)
 
 		if gz.statusCode != 0 {
 			gz.ResponseWriter.WriteHeader(gz.statusCode)

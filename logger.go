@@ -573,7 +573,7 @@ func RequestIDMiddleware(prefix string) Middleware {
 			}
 
 			// Also add to response header for tracing
-			w.Header().Set("X-Request-ID", requestID)
+			setKnownHeader(w.Header(), headerXRequestID, requestID)
 
 			next.ServeHTTP(w, r)
 		})
@@ -595,7 +595,7 @@ func RequestIDFunc(prefix string) MiddlewareFunc {
 		}
 
 		// Also add to response header for tracing
-		w.Header().Set("X-Request-ID", requestID)
+		setKnownHeader(w.Header(), headerXRequestID, requestID)
 
 		next(w, r)
 	}
@@ -611,7 +611,7 @@ func RequestID(prefix string) func(http.Handler) http.Handler {
 			SetRequestID(&r, requestID)
 
 			// Also add to response header
-			w.Header().Set("X-Request-ID", requestID)
+			setKnownHeader(w.Header(), headerXRequestID, requestID)
 
 			next.ServeHTTP(w, r)
 		})

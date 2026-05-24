@@ -159,7 +159,7 @@ func (c *Context) JSONError(status int, message string) error {
 
 // String writes a plain-text response.
 func (c *Context) String(status int, s string) error {
-	c.resp.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	setKnownHeader(c.resp.Header(), headerContentType, contentTypeTextPlain)
 	c.resp.WriteHeader(status)
 	_, err := c.resp.WriteString(s)
 	return err

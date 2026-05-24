@@ -407,7 +407,7 @@ func (app *App) dispatch(w http.ResponseWriter, r *http.Request) {
 // serveNoRoute writes the 405 or 404 response for an unmatched request.
 func (app *App) serveNoRoute(w http.ResponseWriter, r *http.Request) {
 	if allowed := app.router.getAllowedMethods(r.URL.Path); len(allowed) > 0 {
-		w.Header().Set("Allow", strings.Join(allowed, ", "))
+		setKnownHeader(w.Header(), headerAllow, strings.Join(allowed, ", "))
 		if app.methodNotAllowed != nil {
 			app.methodNotAllowed(w, r)
 		} else {
