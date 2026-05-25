@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 )
 
@@ -435,5 +437,61 @@ func TestGetAllowedMethods(t *testing.T) {
 	methods = app.router.getAllowedMethods("/nonexistent")
 	if len(methods) != 0 {
 		t.Errorf("got %d methods for nonexistent, want 0", len(methods))
+	}
+}
+
+func TestStaticSymlinkEscapeBlocked(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks behave differently on Windows; OpenRoot semantics vary")
+	}
+
+	// Two directories: served/ (the docroot) and secret/ (must stay private).
+	tmp, err := os.MkdirTemp("", "surf-symlink-test")
+	if err != nil {
+		t.Fatalf("MkdirTemp: %v", err)
+	}
+	defer os.RemoveAll(tmp)
+
+	served := filepath.Join(tmp, "served")
+	secret := filepath.Join(tmp, "secret")
+	if err := os.MkdirAll(served, 0o755); err != nil {
+		t.Fatalf("mkdir served: %v", err)
+	}
+	if err := os.MkdirAll(secret, 0o755); err != nil {
+		t.Fatalf("mkdir secret: %v", err)
+	}
+
+	// Legitimate file inside the docroot.
+	if err := os.WriteFile(filepath.Join(served, "ok.txt"), []byte("ok"), 0o644); err != nil {
+		t.Fatalf("write ok.txt: %v", err)
+	}
+	// Secret outside the docroot.
+	if err := os.WriteFile(filepath.Join(secret, "passwords.txt"), []byte("hunter2"), 0o644); err != nil {
+		t.Fatalf("write secret: %v", err)
+	}
+	// Symlink inside the docroot pointing OUT to the secret file.
+	if err := os.Symlink(filepath.Join(secret, "passwords.txt"), filepath.Join(served, "escape")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	app := NewApp()
+	app.Static("/files", served)
+
+	// Normal file: served as usual.
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, httptest.NewRequest("GET", "/files/ok.txt", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "ok" {
+		t.Errorf("legit file: code=%d body=%q", rec.Code, rec.Body.String())
+	}
+
+	// Symlink-escape attempt: kernel (openat2 RESOLVE_BENEATH) refuses; 404.
+	rec = httptest.NewRecorder()
+	app.ServeHTTP(rec, httptest.NewRequest("GET", "/files/escape", nil))
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("symlink escape returned status %d, want 404; body=%q",
+			rec.Code, rec.Body.String())
+	}
+	if strings.Contains(rec.Body.String(), "hunter2") {
+		t.Errorf("symlink escape leaked secret content: %q", rec.Body.String())
 	}
 }
