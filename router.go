@@ -405,6 +405,21 @@ func (app *App) dispatch(w http.ResponseWriter, r *http.Request) {
 	c := getContext()
 	rt := tree.searchKV(r.URL.Path, &c.params)
 	if rt == nil {
+		// Try the trailing-slash sibling if the option is enabled and a
+		// sibling exists on the same method tree.
+		if app.redirectTrailingSlash {
+			if alt := toggleTrailingSlash(r.URL.Path); alt != "" {
+				if tree.searchKV(alt, &c.params) != nil {
+					putContext(c)
+					target := alt
+					if r.URL.RawQuery != "" {
+						target += "?" + r.URL.RawQuery
+					}
+					http.Redirect(w, r, target, http.StatusPermanentRedirect)
+					return
+				}
+			}
+		}
 		putContext(c)
 		app.serveNoRoute(w, r)
 		return
@@ -595,6 +610,18 @@ func extractParams(pattern string) []string {
 		}
 	}
 	return params
+}
+
+// toggleTrailingSlash returns p with its trailing slash added or removed.
+// It returns "" for the root path "/" (no meaningful sibling).
+func toggleTrailingSlash(p string) string {
+	if p == "/" || p == "" {
+		return ""
+	}
+	if strings.HasSuffix(p, "/") {
+		return strings.TrimSuffix(p, "/")
+	}
+	return p + "/"
 }
 
 // matchPath checks if a path matches a pattern and extracts parameters

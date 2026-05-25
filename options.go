@@ -89,3 +89,17 @@ func WithErrorHandler(renderer ErrorRenderer) Option {
 		app.errorHandler = renderer
 	}
 }
+
+// WithRedirectTrailingSlash enables automatic redirects between /foo and
+// /foo/ when only one variant of a path is registered. The redirect uses
+// HTTP 308 (Permanent Redirect), which preserves the request method and
+// body — a POST stays a POST, unlike the historic 301 behavior in some
+// clients.
+//
+// Only applies within the same method tree: a request that fails to match
+// is not silently routed to a different HTTP method's handler.
+func WithRedirectTrailingSlash() Option {
+	return func(app *App) {
+		app.redirectTrailingSlash = true
+	}
+}

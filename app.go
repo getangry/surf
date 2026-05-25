@@ -53,6 +53,10 @@ type App struct {
 	errorHandler     ErrorRenderer
 	chain            http.Handler
 	chainOnce        sync.Once
+
+	// redirectTrailingSlash toggles automatic 308 redirects between /foo
+	// and /foo/ when only one variant is registered. Off by default.
+	redirectTrailingSlash bool
 }
 
 // NewApp initializes a new Surf application instance with context and signal handling.
