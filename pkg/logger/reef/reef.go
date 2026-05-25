@@ -1,3 +1,6 @@
+// Package reef is a slog.Handler that renders colored, structured log
+// records to a terminal. Useful in development; switch to a JSON or text
+// handler in production.
 package reef
 
 import (
@@ -465,14 +468,15 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
 		})
 	}
 
-	// Applies groups to temp handler
+	// Applies groups to temp handler. WithGroup already returns slog.Handler;
+	// the type assertion was redundant.
 	for _, group := range h.groups {
-		tempHandler = tempHandler.WithGroup(group).(slog.Handler)
+		tempHandler = tempHandler.WithGroup(group)
 	}
 
-	// Applies filtered attributes to temp handler (without color attribute)
+	// Applies filtered attributes to temp handler (without color attribute).
 	if len(filteredHandlerAttrs) > 0 {
-		tempHandler = tempHandler.WithAttrs(filteredHandlerAttrs).(slog.Handler)
+		tempHandler = tempHandler.WithAttrs(filteredHandlerAttrs)
 	}
 
 	err := tempHandler.Handle(ctx, record)

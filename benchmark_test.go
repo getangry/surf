@@ -224,10 +224,10 @@ func BenchmarkLogging(b *testing.B) {
 // Benchmark JSON operations
 func BenchmarkJSON(b *testing.B) {
 	type TestData struct {
-		ID     string   `json:"id"`
-		Name   string   `json:"name"`
-		Count  int      `json:"count"`
-		Tags   []string `json:"tags"`
+		ID    string   `json:"id"`
+		Name  string   `json:"name"`
+		Count int      `json:"count"`
+		Tags  []string `json:"tags"`
 	}
 
 	data := TestData{

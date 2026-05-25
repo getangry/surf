@@ -877,7 +877,9 @@ func CombinedMiddleware(format string, slogger *slog.Logger) Middleware {
 	}
 }
 
-// Deprecated: Use RequestLoggerOptions instead
+// SlogOptions is an alias retained for backward compatibility.
+//
+// Deprecated: Use RequestLoggerOptions instead.
 type SlogOptions = RequestLoggerOptions
 
 // Deprecated: Use DefaultRequestLoggerOptions instead
