@@ -1,9 +1,10 @@
 package surf
 
 import (
+	"fmt"
 	"net/http"
 	"os"
-	"path/filepath"
+	"path"
 	"strconv"
 	"strings"
 )
@@ -111,46 +112,61 @@ func RedirectSeeOther(w http.ResponseWriter, r *http.Request, url string) {
 }
 
 // Static registers a handler for serving static files from a directory.
-// The prefix is the URL path prefix (e.g., "/static").
-// The dir is the filesystem directory to serve files from.
+// The prefix is the URL path prefix (e.g., "/static"). The dir is the
+// filesystem directory to serve files from.
+//
+// Static uses os.OpenRoot to anchor every file open under dir. On Linux
+// this resolves via openat2(RESOLVE_BENEATH) so symlinks pointing outside
+// dir and any "../" component are rejected by the kernel — not by string
+// inspection that an attacker can encode around. Symlinks within dir
+// continue to work normally.
+//
+// Static panics at registration if dir does not exist or is not a directory.
+// The *os.Root opened here lives for the lifetime of the app.
 func (app *App) Static(prefix, dir string) {
-	// Ensure prefix starts with / and doesn't end with /
 	if !strings.HasPrefix(prefix, "/") {
 		prefix = "/" + prefix
 	}
 	prefix = strings.TrimSuffix(prefix, "/")
 
-	// Create file server
-	fs := http.FileServer(http.Dir(dir))
-	handler := http.StripPrefix(prefix, fs)
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		panic(fmt.Sprintf("surf: Static(%q, %q): %v", prefix, dir, err))
+	}
 
-	// Register wildcard route
-	app.Get(prefix+"/*", func(w http.ResponseWriter, r *http.Request) error {
-		// Get the file path from wildcard
-		filePath := Param(r, "*")
-
-		// Security: prevent directory traversal
-		if strings.Contains(filePath, "..") {
+	serve := func(w http.ResponseWriter, r *http.Request) error {
+		// path.Clean collapses any "." / ".."; Root.Open also rejects ".."
+		// and absolute paths, but cleaning first turns oddly-shaped requests
+		// into clean 404s instead of errors.
+		rel := strings.TrimPrefix(Param(r, "*"), "/")
+		clean := strings.TrimPrefix(path.Clean("/"+rel), "/")
+		if clean == "" || clean == "." {
 			http.NotFound(w, r)
 			return nil
 		}
 
-		// Check if file exists
-		fullPath := filepath.Join(dir, filePath)
-		info, err := os.Stat(fullPath)
+		f, err := root.Open(clean)
+		if err != nil {
+			// File missing, symlink escape, or any other open error.
+			http.NotFound(w, r)
+			return nil
+		}
+		defer f.Close()
+
+		info, err := f.Stat()
 		if err != nil || info.IsDir() {
 			http.NotFound(w, r)
 			return nil
 		}
 
-		// Serve the file
-		handler.ServeHTTP(w, r)
+		http.ServeContent(w, r, info.Name(), info.ModTime(), f)
 		return nil
-	})
+	}
 
-	// Also handle the prefix without wildcard for root of static dir
+	app.Get(prefix+"/*", serve)
+
+	// Redirect bare /prefix to /prefix/ for consistency.
 	app.Get(prefix, func(w http.ResponseWriter, r *http.Request) error {
-		// Redirect to prefix/ if needed
 		http.Redirect(w, r, prefix+"/", http.StatusMovedPermanently)
 		return nil
 	})

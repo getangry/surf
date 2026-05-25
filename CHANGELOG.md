@@ -2,6 +2,53 @@
 
 All notable changes to Surf are documented in this file.
 
+## v0.2.1
+
+A small additive release picking up ideas from two superseded community PRs
+(#1 "Security improvements" and #2 "Router improvements") and grafting them
+onto the post-v0.2.0 API.
+
+### Added
+
+- **`ResponseWriter.Committed()`** reports whether the response has begun
+  (either `WriteHeader` or `Write` was called). Useful for any
+  middleware/handler that wants to know whether it's still safe to write
+  an error response. The existing error renderer migrated to it.
+- **`WithRedirectTrailingSlash()`** app option. When enabled, a request
+  whose path doesn't match but whose trailing-slash sibling does receives
+  a **308 Permanent Redirect** to the registered variant. Method-scoped:
+  a POST to `/foo/` does not redirect to a GET-only `/foo`. Off by default.
+  Query strings are preserved.
+
+### Security
+
+- **`Static` now uses `os.OpenRoot`** for kernel-enforced path containment.
+  On Linux this resolves every open through `openat2(RESOLVE_BENEATH)`, so
+  symlink-escape attempts and `../` components are rejected by the kernel
+  rather than by string inspection. Previous implementation used
+  `http.Dir` + a `strings.Contains("..")` check; the new test
+  `TestStaticSymlinkEscapeBlocked` documents the symlink protection.
+
+  Behavior note: `Static` now panics at registration if the directory does
+  not exist or is not a directory. Previously it silently 404'd at request
+  time. Catching the misconfiguration loudly at startup is the safer
+  default.
+
+### Tests
+
+- Five new middleware-level tests for CORS edge cases (no-Origin header,
+  unlisted-origin behavior), Timeout context cancellation observed by the
+  handler, and per-peer / spoofed-XFF behavior of the rate limiter when
+  using `KeyByIP()`.
+
+### Known issue surfaced
+
+- The legacy `DefaultRateLimitConfig().KeyFunc` still honors
+  `X-Forwarded-For` without proxy verification — a pre-v0.1.0 default
+  that `KeyByIP()` and `TrustedProxies` were meant to replace but never
+  made the default. Slated for a focused follow-up. Workaround today:
+  pass `KeyFunc: surf.KeyByIP(trustedProxies...)` explicitly.
+
 ## v0.2.0
 
 A performance release that closes most of the gap to gin and echo on the
