@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+# All third-party actions are pinned to a full commit SHA, not a floating tag.
+# The trailing comment records the human-readable version pinned. Renovate /
+# Dependabot will propose PRs to bump these as new releases ship.
+jobs:
+  lint-and-test:
+    name: lint + test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l $(git ls-files '*.go' | grep -v '^example/') || true)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt issues in:"
+            echo "$unformatted"
+            echo
+            echo "Run: gofmt -w $unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet .
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9.2.1
+        with:
+          # Pin the linter binary version explicitly; not "latest".
+          version: v2.12.2
+          args: --timeout=5m
+
+      - name: go test
+        run: go test -race -count=1 .

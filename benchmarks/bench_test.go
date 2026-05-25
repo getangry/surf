@@ -10,8 +10,8 @@ import (
 	"testing"
 
 	"github.com/getangry/surf"
-	chi "github.com/go-chi/chi/v5"
 	"github.com/gin-gonic/gin"
+	chi "github.com/go-chi/chi/v5"
 	echo "github.com/labstack/echo/v4"
 )
 
