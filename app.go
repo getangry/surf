@@ -1,3 +1,7 @@
+// Package surf is a small HTTP framework for Go: a radix-tree router with
+// two handler models — stdlib-compatible func(w, r) error and an opt-in
+// pooled-Context fast path — a small standard middleware suite, and zero
+// third-party dependencies.
 package surf
 
 import (

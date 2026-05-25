@@ -1,0 +1,152 @@
+---
+title: Context (Fast Path)
+description: The pooled *surf.Context handler model
+---
+
+# Context — the fast path
+
+For the hottest endpoints, `App.Handle` registers a handler that receives a
+pooled `*surf.Context` directly instead of `(w, r)`. The router copies neither
+the request nor allocates per-request state — about **twice as fast as the
+standard path** and in the same tier as `net/http.ServeMux`.
+
+```go
+app.Handle("GET", "/users/:id", func(c *surf.Context) error {
+    return c.JSONData(map[string]string{"id": c.Param("id")})
+})
+```
+
+The standard `func(w, r) error` path is unchanged and fully supported. Both
+coexist on the same `App`.
+
+## When to use which
+
+| Use the fast path when… | Use the standard path when… |
+|---|---|
+| The route is in a hot loop (health, lookup-by-ID, telemetry ingest) | You need to use `surf.Param(r, ...)` / `surf.Service[T](r)` |
+| You can write the handler in terms of `*Context` | You need to integrate `http.Handler`-based middleware in `Before`/`After` |
+| Latency and allocations matter | The route already does heavier work where framework overhead is dust |
+
+## The Context API
+
+```go
+c.Request                          // the original *http.Request (no copy)
+c.Writer()                         // *surf.ResponseWriter for status tracking
+
+c.Method()                         // request method
+c.Path()                           // request URL path
+c.Param("id")                      // path parameter (or "*" for wildcard)
+c.Query("page")                    // URL query parameter
+c.Header("Authorization")          // request header
+c.SetHeader("X-Trace", "abc")      // response header
+
+c.Status()                         // current response status code
+
+c.Bind(&body)                      // JSON body binding
+c.BindAndValidate(&body)           // + Validator hook
+
+c.JSON(status, v)                  // raw JSON write
+c.JSONData(v)                      // {"data": v}
+c.JSONError(status, message)       // {"error": ..., "status": ...}
+c.String(status, "ok")             // plain-text response
+c.NoContent(status)                // status only, no body
+
+c.Context()                        // underlying context.Context
+```
+
+## Composing fast-path middleware
+
+`CtxMiddleware` wraps a `CtxHandler`. Pass middleware as trailing variadic
+arguments to `App.Handle`:
+
+```go
+func ctxAuth(next surf.CtxHandler) surf.CtxHandler {
+    return func(c *surf.Context) error {
+        if c.Header("Authorization") == "" {
+            return surf.NewHTTPError(http.StatusUnauthorized, "missing token")
+        }
+        return next(c)
+    }
+}
+
+app.Handle("GET", "/me", profile, ctxAuth)
+```
+
+App-level standard `Middleware` (`app.Use(...)`) **still wraps fast routes**,
+so Recovery / CORS / Logging / Metrics keep working without changes.
+
+## Services from a fast handler
+
+`Service[T]` reads from the standard-path's request state, which the fast
+path does not create. Use `CtxService[T]` instead:
+
+```go
+surf.Provide[*sql.DB](app, db)
+
+app.Handle("GET", "/widgets/:id", func(c *surf.Context) error {
+    db, ok := surf.CtxService[*sql.DB](c)
+    if !ok {
+        return surf.NewHTTPError(http.StatusInternalServerError, "db missing")
+    }
+    // ...
+    return c.NoContent(http.StatusOK)
+})
+```
+
+## Groups
+
+`Group.Handle` applies only the group's **prefix** to a fast route. Group
+`HandlerFunc`-based middleware (`Before`, `After`) and `http.Handler`-based
+`Use` do not wrap a `CtxHandler` — compose with `CtxMiddleware` instead.
+
+```go
+api := app.Group("/api")
+api.Handle("GET", "/v", func(c *surf.Context) error {
+    return c.String(http.StatusOK, "ok")
+})
+// matches GET /api/v
+```
+
+## The pooling contract — don't break it
+
+A `*Context` is checked out of a `sync.Pool` for the duration of the handler
+and returned the moment the handler returns. **Do not retain `c` (or
+`c.Request`) in a goroutine that outlives the handler** — a reused Context
+will read another request's data.
+
+The same contract applies to gin's `*gin.Context` and echo's `echo.Context`.
+If you must outlive the handler, copy the values you need first:
+
+```go
+app.Handle("POST", "/work", func(c *surf.Context) error {
+    payload := c.Header("X-Work")            // copy the string
+    go process(payload)                       // safe — uses the copy
+    return c.NoContent(http.StatusAccepted)
+})
+```
+
+## Performance
+
+On an isolated param-route benchmark (Apple Silicon):
+
+| Router | ns/op | allocs/op |
+|---|---|---|
+| `net/http.ServeMux` | 80 | 2 |
+| gin / echo | 55 / 57 | 1 / 1 |
+| chi | 196 | 5 |
+| surf (standard `func(w, r)`) | ~160 | 3 |
+| **surf (fast path `App.Handle`)** | **~100** | **2** |
+
+See [Performance](/docs/performance) for the profile and roadmap for closing
+the remaining gap.
+
+## Next Steps
+
+<Cards>
+  <Card title="Services" href="/docs/services">
+    Typed dependency injection with `Provide`/`Service`/`CtxService`
+  </Card>
+  <Card title="Performance" href="/docs/performance">
+    Benchmark results and the v0.1.1 roadmap
+  </Card>
+</Cards>

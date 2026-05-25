@@ -1,236 +1,179 @@
 ---
 title: Error Handling
-description: Custom error handlers for 404 and 405 responses
+description: Returned errors become responses — HTTPError, Abort, JSON envelopes
 ---
 
 # Error Handling
 
-Surf provides customizable error handling for common HTTP error scenarios.
+Handlers return `error`. Surf renders that error to the client through a
+configurable renderer. The default behavior:
 
-## Custom 404 Handler
+- A returned `*HTTPError` becomes a JSON error envelope with its status code.
+- Any other error becomes a generic 500 (internal detail is logged, never
+  serialized to the client).
+- A returned `surf.Abort` stops processing silently — useful when the handler
+  has already written the response.
+- If the handler already wrote a response before returning an error, the
+  renderer is **skipped** so the response is preserved.
 
-Handle requests to non-existent routes:
-
-```go
-app := surf.NewApp()
-
-app.NotFound(func(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(http.StatusNotFound)
-    json.NewEncoder(w).Encode(map[string]interface{}{
-        "error":   "Not Found",
-        "message": "The requested resource does not exist",
-        "path":    r.URL.Path,
-    })
-})
-```
-
-### HTML 404 Page
-
-```go
-app.NotFound(func(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "text/html")
-    w.WriteHeader(http.StatusNotFound)
-    http.ServeFile(w, r, "./templates/404.html")
-})
-```
-
-### API vs Web 404
-
-```go
-app.NotFound(func(w http.ResponseWriter, r *http.Request) {
-    // JSON for API routes
-    if strings.HasPrefix(r.URL.Path, "/api/") {
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusNotFound)
-        json.NewEncoder(w).Encode(map[string]string{
-            "error": "Resource not found",
-        })
-        return
-    }
-
-    // HTML for web routes
-    w.Header().Set("Content-Type", "text/html")
-    w.WriteHeader(http.StatusNotFound)
-    http.ServeFile(w, r, "./templates/404.html")
-})
-```
-
-## Custom 405 Handler
-
-Handle requests with invalid HTTP methods:
-
-```go
-app.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(http.StatusMethodNotAllowed)
-    json.NewEncoder(w).Encode(map[string]interface{}{
-        "error":   "Method Not Allowed",
-        "message": fmt.Sprintf("%s is not allowed for this resource", r.Method),
-        "allowed": w.Header().Get("Allow"), // Surf sets this automatically
-    })
-})
-```
-
-<Callout type="info">
-  Surf automatically sets the `Allow` header with valid methods when returning 405.
-</Callout>
-
-### Example Scenario
-
-```go
-app.Get("/users", listUsers)   // Only GET is allowed
-app.Post("/users", createUser) // POST is also allowed
-
-// Request: DELETE /users
-// Response: 405 Method Not Allowed
-// Headers: Allow: GET, POST
-```
-
-## Handler Errors
-
-When a handler returns an error, Surf logs it and returns 500:
-
-```go
-app.Get("/data", func(w http.ResponseWriter, r *http.Request) error {
-    data, err := fetchFromDatabase()
-    if err != nil {
-        // Logged internally, returns 500 to client
-        return err
-    }
-    return json.NewEncoder(w).Encode(data)
-})
-```
-
-### Custom Error Responses
-
-For custom error handling, handle errors in the handler:
+## HTTPError — typed responses
 
 ```go
 app.Get("/users/:id", func(w http.ResponseWriter, r *http.Request) error {
     id := surf.Param(r, "id")
-
-    user, err := getUserByID(id)
-    if err != nil {
-        if errors.Is(err, ErrNotFound) {
-            w.WriteHeader(http.StatusNotFound)
-            return json.NewEncoder(w).Encode(map[string]string{
-                "error": "User not found",
-            })
-        }
-        // Let Surf handle unexpected errors
-        return err
+    user, err := store.Find(id)
+    if errors.Is(err, ErrNotFound) {
+        return surf.NewHTTPError(http.StatusNotFound, "user not found")
     }
-
-    return json.NewEncoder(w).Encode(user)
+    if err != nil {
+        return surf.Errorf(http.StatusInternalServerError, "lookup failed", err)
+        // The wrapped err is logged but never sent to the client.
+    }
+    return surf.JSONData(w, user)
 })
 ```
 
-## Recovery Middleware
+The default renderer produces:
 
-Use the Recovery middleware to handle panics gracefully:
+```json
+{ "error": "user not found", "status": 404 }
+```
+
+## Abort — silent completion
+
+When a handler has already written its response (a streaming endpoint, a
+hand-rolled custom status, an SSE flush loop), return `surf.Abort` to tell the
+router not to render anything further:
+
+```go
+app.Get("/events", func(w http.ResponseWriter, r *http.Request) error {
+    rw := surf.GetResponseWriter(r)
+    rw.Header().Set("Content-Type", "text/event-stream")
+    rw.WriteHeader(http.StatusOK)
+    for { /* write events */ }
+    return surf.Abort
+})
+```
+
+`http.ErrAbortHandler` is also honored for compatibility with the stdlib idiom.
+
+## JSON Envelope Helpers
+
+```go
+surf.JSON(w, 200, v)                 // raw value
+surf.JSONData(w, v)                  // {"data": v}
+surf.JSONList(w, items, total)       // {"data": [...], "total": n}
+surf.JSONError(w, 404, "not found")  // {"error": "not found", "status": 404}
+```
+
+`JSONDataStatus(w, status, v)` lets you wrap data with a non-200 status (e.g.
+`201 Created`).
+
+On the [fast path](/docs/context), the equivalent methods live on `*Context`.
+
+## Custom Renderer
+
+`WithErrorHandler` replaces the default renderer. Use it to integrate with
+your existing error-response format:
+
+```go
+app := surf.NewApp(surf.WithErrorHandler(func(w http.ResponseWriter, r *http.Request, err error) {
+    var httpErr *surf.HTTPError
+    if errors.As(err, &httpErr) {
+        _ = surf.JSON(w, httpErr.Code, map[string]any{
+            "ok":      false,
+            "code":    httpErr.Code,
+            "message": httpErr.Message,
+            "trace":   r.Header.Get("X-Request-ID"),
+        })
+        return
+    }
+    _ = surf.JSON(w, http.StatusInternalServerError, map[string]any{
+        "ok":      false,
+        "message": "internal error",
+    })
+}))
+```
+
+The renderer is **only invoked when the response has not been written**. A
+handler that returns an error after writing keeps its response intact.
+
+## Validation Errors
+
+`BindAndValidate` returns a `422 *HTTPError` whose `Message` is the
+validator's error message — so it flows through the renderer without extra
+code:
+
+```go
+type SignupBody struct {
+    Name  string `json:"name"`
+    Email string `json:"email"`
+}
+
+func (b SignupBody) Validate() error {
+    if b.Name == "" {
+        return errors.New("name is required")
+    }
+    return nil
+}
+
+app.Post("/signup", func(w http.ResponseWriter, r *http.Request) error {
+    var body SignupBody
+    if err := surf.BindAndValidate(r, &body); err != nil {
+        return err  // 400 for bad JSON, 413 over limit, 422 for validation
+    }
+    return surf.JSONDataStatus(w, http.StatusCreated, body)
+})
+```
+
+## Custom 404 and 405
+
+When no route matches a request, surf returns 404; when the path matches a
+route registered for a different method, surf returns 405 with an `Allow`
+header. Override either:
+
+```go
+app.NotFound(func(w http.ResponseWriter, r *http.Request) {
+    _ = surf.JSONError(w, http.StatusNotFound, "no such endpoint")
+})
+
+app.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
+    _ = surf.JSON(w, http.StatusMethodNotAllowed, map[string]string{
+        "error":   "method not allowed",
+        "allowed": w.Header().Get("Allow"),
+    })
+})
+```
+
+## Recovery from Panics
+
+The Recovery middleware catches panics, logs the stack, and writes a generic
+500 (or your `RecoveryHandler`):
+
+```go
+app.Use(surf.RecoveryWithDefaults())
+```
 
 ```go
 app.Use(surf.Recovery(surf.RecoveryConfig{
+    Logger:    slog.Default(),
+    StackSize: 4 << 10,
     RecoveryHandler: func(w http.ResponseWriter, r *http.Request, err interface{}) {
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusInternalServerError)
-        json.NewEncoder(w).Encode(map[string]string{
-            "error": "Internal server error",
-        })
+        _ = surf.JSONError(w, http.StatusInternalServerError, "internal error")
     },
 }))
 ```
 
-## Error Response Structure
-
-A consistent error response structure is recommended:
-
-```go
-type ErrorResponse struct {
-    Error   string      `json:"error"`
-    Message string      `json:"message,omitempty"`
-    Code    string      `json:"code,omitempty"`
-    Details interface{} `json:"details,omitempty"`
-}
-
-func respondError(w http.ResponseWriter, status int, err ErrorResponse) {
-    w.Header().Set("Content-Type", "application/json")
-    w.WriteHeader(status)
-    json.NewEncoder(w).Encode(err)
-}
-
-// Usage
-app.Get("/users/:id", func(w http.ResponseWriter, r *http.Request) error {
-    user, err := getUser(surf.Param(r, "id"))
-    if err != nil {
-        respondError(w, http.StatusNotFound, ErrorResponse{
-            Error:   "Not Found",
-            Message: "User does not exist",
-            Code:    "USER_NOT_FOUND",
-        })
-        return nil
-    }
-    return json.NewEncoder(w).Encode(user)
-})
-```
-
-## Complete Example
-
-```go
-package main
-
-import (
-    "encoding/json"
-    "net/http"
-    "strings"
-
-    "github.com/getangry/surf"
-)
-
-func main() {
-    app := surf.NewApp()
-
-    // Recovery middleware
-    app.Use(surf.RecoveryWithDefaults())
-
-    // Custom 404
-    app.NotFound(func(w http.ResponseWriter, r *http.Request) {
-        if strings.HasPrefix(r.URL.Path, "/api/") {
-            w.Header().Set("Content-Type", "application/json")
-            w.WriteHeader(http.StatusNotFound)
-            json.NewEncoder(w).Encode(map[string]string{
-                "error": "Endpoint not found",
-            })
-            return
-        }
-        http.ServeFile(w, r, "./public/404.html")
-    })
-
-    // Custom 405
-    app.MethodNotAllowed(func(w http.ResponseWriter, r *http.Request) {
-        w.Header().Set("Content-Type", "application/json")
-        w.WriteHeader(http.StatusMethodNotAllowed)
-        json.NewEncoder(w).Encode(map[string]string{
-            "error":   "Method not allowed",
-            "allowed": w.Header().Get("Allow"),
-        })
-    })
-
-    // Routes
-    app.Get("/api/health", healthCheck)
-
-    app.Serve()
-}
-```
+Always register Recovery first — it must wrap every other middleware to catch
+their panics.
 
 ## Next Steps
 
 <Cards>
-  <Card title="API Reference" href="/docs/api-reference">
-    Complete API documentation
+  <Card title="Helpers" href="/docs/helpers">
+    Body binding, JSON envelopes, query helpers
   </Card>
-  <Card title="Middleware" href="/docs/middleware">
-    Built-in middleware options
+  <Card title="Context (Fast Path)" href="/docs/context">
+    Error handling on the pooled `*Context`
   </Card>
 </Cards>

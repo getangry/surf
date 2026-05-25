@@ -68,8 +68,8 @@ func TestRouterPathParameters(t *testing.T) {
 
 	app.Get("/users/:id/posts/:postId", func(w http.ResponseWriter, r *http.Request) error {
 		id := Param(r, "id")
-		postId := Param(r, "postId")
-		w.Write([]byte("user:" + id + ",post:" + postId))
+		postID := Param(r, "postId")
+		w.Write([]byte("user:" + id + ",post:" + postID))
 		return nil
 	})
 

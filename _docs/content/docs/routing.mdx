@@ -1,15 +1,14 @@
 ---
 title: Routing
-description: Learn about Surf's high-performance routing system
+description: Routes, path parameters, groups, and per-route middleware
 ---
 
 # Routing
 
-Surf uses a radix tree-based router that provides O(log n) route matching, making it extremely fast even with hundreds of routes.
+Surf uses a radix-tree router. Routes are matched in O(log n); the order they
+are registered does not affect performance.
 
 ## Basic Routes
-
-Register routes for different HTTP methods:
 
 ```go
 app := surf.NewApp()
@@ -23,132 +22,157 @@ app.Head("/users", headUsers)
 app.Options("/users", optionsUsers)
 ```
 
-## Path Parameters
-
-Use `:name` syntax to capture dynamic path segments:
-
-```go
-app.Get("/users/:id", func(w http.ResponseWriter, r *http.Request) error {
-    id := surf.Param(r, "id")
-    // id = "123" for request to /users/123
-    return nil
-})
-
-app.Get("/posts/:postId/comments/:commentId", func(w http.ResponseWriter, r *http.Request) error {
-    postId := surf.Param(r, "postId")
-    commentId := surf.Param(r, "commentId")
-    return nil
-})
-```
-
-## Wildcard Routes
-
-Use `*` to match any path suffix:
-
-```go
-app.Get("/files/*", func(w http.ResponseWriter, r *http.Request) error {
-    path := surf.Param(r, "*")
-    // path = "docs/readme.md" for request to /files/docs/readme.md
-    return nil
-})
-```
-
-<Callout type="info">
-  Wildcard routes are useful for serving static files or implementing catch-all handlers.
-</Callout>
-
-## Route Groups
-
-Organize routes with common prefixes and middleware:
-
-```go
-// Create a group with prefix
-api := app.Group("/api/v1")
-
-// Add group-specific middleware
-api.Before(func(w http.ResponseWriter, r *http.Request) error {
-    w.Header().Set("Content-Type", "application/json")
-    return nil
-})
-
-// Register routes in the group
-api.Get("/users", listUsers)      // GET /api/v1/users
-api.Post("/users", createUser)    // POST /api/v1/users
-api.Get("/users/:id", getUser)    // GET /api/v1/users/:id
-```
-
-### Nested Groups
-
-Groups can be nested for better organization:
-
-```go
-api := app.Group("/api")
-
-v1 := api.Group("/v1")
-v1.Get("/users", listUsersV1)
-
-v2 := api.Group("/v2")
-v2.Get("/users", listUsersV2)  // Different implementation
-```
-
-### Group Middleware
-
-Apply middleware to specific groups:
-
-```go
-// Public routes
-public := app.Group("/public")
-public.Get("/health", healthCheck)
-
-// Protected routes with auth middleware
-protected := app.Group("/admin")
-protected.Before(authMiddleware)
-protected.Get("/dashboard", dashboard)
-protected.Get("/settings", settings)
-```
-
-## Handler Signature
-
-All handlers use the same signature:
+The handler signature is:
 
 ```go
 type HandlerFunc func(w http.ResponseWriter, r *http.Request) error
 ```
 
-Return `nil` for success or an `error` for failure:
+A returned error is rendered to the client by the [error
+renderer](/docs/error-handling) — return `*HTTPError` for a typed response, or
+`nil` after writing your own.
+
+## Path Parameters
+
+`:name` captures a path segment:
 
 ```go
-app.Get("/data", func(w http.ResponseWriter, r *http.Request) error {
-    data, err := fetchData()
-    if err != nil {
-        return err  // Will be logged and return 500
-    }
-
-    return json.NewEncoder(w).Encode(data)
+app.Get("/users/:id", func(w http.ResponseWriter, r *http.Request) error {
+    id := surf.Param(r, "id")
+    return surf.JSONData(w, map[string]string{"id": id})
 })
 ```
 
+<Callout type="warn">
+  Use a single consistent parameter name across the codebase (`:id` everywhere,
+  not `:userId` here and `:resourceId` there). Different param names at the
+  same tree position silently bind to the first registered name — this is
+  inherent to radix routers.
+</Callout>
+
+## Wildcard Routes
+
+`*` matches the remainder of the path and is read with `Param(r, "*")`:
+
+```go
+app.Get("/files/*", func(w http.ResponseWriter, r *http.Request) error {
+    path := surf.Param(r, "*")
+    return surf.JSONData(w, map[string]string{"path": path})
+})
+```
+
+## Per-Route Middleware
+
+Standard `Middleware` (`func(http.Handler) http.Handler`) can be attached to
+any route as trailing variadic arguments. It wraps the handler in declaration
+order (outermost first):
+
+```go
+app.Post("/admin", createAdmin, requireAuth, auditLog)
+```
+
+Per-route middleware can short-circuit by not calling `next`, and can
+propagate context with `r.WithContext`. It is the recommended way to attach
+auth / authz to a single route.
+
+## Route Groups
+
+Groups share a prefix and optionally share middleware:
+
+```go
+api := app.Group("/api/v1")
+
+api.Get("/users", listUsers)      // GET /api/v1/users
+api.Post("/users", createUser)    // POST /api/v1/users
+api.Get("/users/:id", getUser)    // GET /api/v1/users/:id
+```
+
+### Group.Use — standard middleware on every route in the group
+
+```go
+api := app.Group("/api").Use(requireAuth, surf.RateLimitWithDefaults())
+api.Get("/users", listUsers)   // auth + rate limit applied
+api.Get("/orders", listOrders) // same
+```
+
+### Group.Before / Group.After — legacy `HandlerFunc` wrappers
+
+```go
+api := app.Group("/api").Before(func(w http.ResponseWriter, r *http.Request) error {
+    w.Header().Set("Content-Type", "application/json")
+    return nil
+})
+```
+
+### Group.Skip — exclude routes from group middleware
+
+A pattern ending in `*` matches by prefix; otherwise it must match the route's
+full pattern exactly. **Call `Skip` before registering the affected routes.**
+
+```go
+api := app.Group("/api").Before(requireAuth)
+api.Skip("/api/health")
+api.Get("/health", healthz)   // no auth
+api.Get("/users", listUsers)  // auth applied
+```
+
+### Nested groups
+
+Nested groups inherit their parent's prefix, before/after handlers, middleware,
+and skip patterns:
+
+```go
+api := app.Group("/api").Use(requireAuth)
+
+v1 := api.Group("/v1")
+v1.Get("/users", listUsersV1)   // /api/v1/users, auth applied
+
+v2 := api.Group("/v2")
+v2.Get("/users", listUsersV2)   // /api/v2/users, auth applied
+```
+
+## Fast-Path Routes
+
+For hot endpoints, `App.Handle` (and `Group.Handle`) registers a handler that
+receives a pooled `*surf.Context` directly. The router copies neither the
+request nor allocates per-request state — about twice as fast as the standard
+path.
+
+```go
+app.Handle("GET", "/users/:id", func(c *surf.Context) error {
+    return c.JSONData(map[string]string{"id": c.Param("id")})
+})
+```
+
+See [Context (Fast Path)](/docs/context) for the full API.
+
+## 404 and 405
+
+When no route matches a path, surf responds with **404 Not Found**. When a
+path matches a route registered for a different method, surf responds with
+**405 Method Not Allowed** and sets the `Allow` response header listing valid
+methods. Both are customizable — see [Error Handling](/docs/error-handling).
+
 ## Performance
 
-The radix tree router provides significant performance benefits:
+| Routes | Linear search | Radix tree | Improvement |
+|--------|---------------|------------|-------------|
+| 10     | ~500 ns       | ~70 ns     | 7×          |
+| 100    | ~5.4 µs       | ~74 ns     | 73×         |
+| 1000   | ~54 µs        | ~78 ns     | 692×        |
 
-| Routes | Linear Search | Radix Tree | Improvement |
-|--------|--------------|------------|-------------|
-| 10     | ~500ns       | ~70ns      | 7x faster   |
-| 100    | ~5,400ns     | ~74ns      | 73x faster  |
-| 1000   | ~54,000ns    | ~78ns      | 692x faster |
-
-<Callout type="tip">
-  Route order doesn't matter with radix tree routing - performance is consistent regardless of registration order.
-</Callout>
+See [Performance](/docs/performance) for the cross-framework comparison.
 
 ## Next Steps
 
 <Cards>
   <Card title="Middleware" href="/docs/middleware">
-    Add cross-cutting concerns to your routes
+    Standard middleware suite and composition
   </Card>
-  <Card title="Query Helpers" href="/docs/helpers">
-    Parse query parameters with type safety
+  <Card title="Error Handling" href="/docs/error-handling">
+    HTTPError, JSON envelopes, custom renderers
+  </Card>
+  <Card title="Context (Fast Path)" href="/docs/context">
+    `App.Handle` and `*surf.Context`
   </Card>
 </Cards>

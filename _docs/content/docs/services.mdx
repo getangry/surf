@@ -1,0 +1,132 @@
+---
+title: Services
+description: Typed dependency injection with Provide[T] and Service[T]
+---
+
+# Services
+
+A typed service container, keyed by Go type instead of string. This is the
+recommended way to wire dependencies (database, cache, auth, third-party
+clients) into handlers — `Service[T]` and friends cannot silently return a
+zero value because of a key typo or mismatched type.
+
+## Register
+
+```go
+app := surf.NewApp()
+
+surf.Provide[*sql.DB](app, db)
+surf.Provide[Authenticator](app, oktaAuth)   // register under an interface
+surf.Provide[*cache.Client](app, cacheClient)
+```
+
+`Provide[T]` keys the value by the reflected type of `T`. Two distinct types
+do not collide — registering `*sql.DB` and `*pgxpool.Pool` produces two
+separate slots.
+
+## Resolve
+
+### Standard-path handler
+
+```go
+app.Get("/users/:id", func(w http.ResponseWriter, r *http.Request) error {
+    db, ok := surf.Service[*sql.DB](r)
+    if !ok {
+        return surf.NewHTTPError(http.StatusInternalServerError, "db missing")
+    }
+
+    auth := surf.MustService[Authenticator](r) // panics if missing → 500 via Recovery
+    _ = auth
+    _ = db
+    return nil
+})
+```
+
+### Fast-path handler
+
+`*surf.Context` does not carry the standard-path request state, so use
+`CtxService[T]`:
+
+```go
+app.Handle("GET", "/healthz", func(c *surf.Context) error {
+    db, ok := surf.CtxService[*sql.DB](c)
+    if !ok {
+        return surf.NewHTTPError(http.StatusInternalServerError, "db missing")
+    }
+    _ = db.Ping()
+    return c.String(http.StatusOK, "ok")
+})
+```
+
+## Service vs MustService
+
+| Function | Behavior |
+|---|---|
+| `Service[T](r)` | Returns `(value, ok)`. Use when a missing service is recoverable. |
+| `MustService[T](r)` | Returns `value`, panics on miss. Use for dependencies the app cannot function without — Recovery turns the panic into a clean 500. |
+| `CtxService[T](c)` | The fast-path equivalent of `Service[T]`. |
+
+## Registering under interfaces
+
+A common pattern is to register a concrete implementation under its interface
+so handlers depend only on the interface:
+
+```go
+type EmailSender interface {
+    Send(to, subject, body string) error
+}
+
+surf.Provide[EmailSender](app, sendgrid.NewClient(apiKey))
+
+// Handlers depend only on the interface:
+app.Post("/signup", func(w http.ResponseWriter, r *http.Request) error {
+    mail := surf.MustService[EmailSender](r)
+    return mail.Send("user@example.com", "Welcome", "...")
+})
+```
+
+## Untyped (legacy) container
+
+`App.Set(key any, value any)` and `App.GetService(key any) any` are also
+available, primarily for cases where the type isn't known at compile time.
+**Prefer the typed API for new code** — it eliminates a class of "registered
+the wrong concrete type, got nil at request time" bugs.
+
+```go
+app.Set("config", myConfig)
+cfg := app.GetService("config").(*Config)
+```
+
+## Wiring example
+
+```go
+func main() {
+    db, err := sql.Open("postgres", os.Getenv("DATABASE_URL"))
+    if err != nil {
+        log.Fatal(err)
+    }
+
+    app := surf.NewApp()
+    app.Use(surf.RecoveryWithDefaults())
+
+    surf.Provide[*sql.DB](app, db)
+    surf.Provide[Authenticator](app, oktaAuth)
+    surf.Provide[*cache.Client](app, cacheClient)
+
+    app.Get("/users/:id", getUser)
+    app.Post("/users", createUser)
+
+    app.Serve()
+}
+```
+
+## Next Steps
+
+<Cards>
+  <Card title="Context (Fast Path)" href="/docs/context">
+    Using `CtxService` from a `*Context` handler
+  </Card>
+  <Card title="Error Handling" href="/docs/error-handling">
+    Returning `*HTTPError` from service lookups
+  </Card>
+</Cards>

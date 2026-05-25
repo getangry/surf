@@ -1,190 +1,189 @@
 ---
 title: Helpers
-description: Query parameter helpers and redirect utilities
+description: Body binding, JSON envelopes, query helpers, redirects, client IP
 ---
 
 # Helpers
 
-Surf provides convenient helper functions for common HTTP operations like parsing query parameters and handling redirects.
+This page covers the small per-request utilities: JSON request-body binding,
+JSON response envelopes, query-parameter parsing, redirects, and the
+proxy-aware client-IP helper.
 
-## Query Parameters
+## Request Body Binding
 
-Type-safe query parameter parsing with sensible defaults.
-
-### String Parameters
-
-```go
-// Get raw query parameter (empty string if missing)
-name := surf.Query(r, "name")
-
-// Get with default value
-name := surf.QueryDefault(r, "name", "anonymous")
-```
-
-### Numeric Parameters
+Decode a JSON request body into a struct, enforcing a size limit and content
+type:
 
 ```go
-// Integer with default
-page := surf.QueryInt(r, "page", 1)
-limit := surf.QueryInt(r, "limit", 20)
-
-// Int64 for large numbers
-offset := surf.QueryInt64(r, "offset", 0)
-
-// Float64 for decimals
-price := surf.QueryFloat(r, "price", 0.0)
-```
-
-<Callout type="info">
-  If the value cannot be parsed, the default is returned. No errors are raised.
-</Callout>
-
-### Boolean Parameters
-
-```go
-// Accepts: "true", "1", "yes", "on" (case-insensitive)
-active := surf.QueryBool(r, "active", true)
-verbose := surf.QueryBool(r, "verbose", false)
-```
-
-| Value | Result |
-|-------|--------|
-| `true`, `TRUE`, `True` | `true` |
-| `1` | `true` |
-| `yes`, `YES` | `true` |
-| `on`, `ON` | `true` |
-| `false`, `0`, `no`, `off` | `false` |
-| (missing) | default value |
-| (invalid) | `false` |
-
-### Slice Parameters
-
-For multi-value parameters like `?tags=a&tags=b&tags=c`:
-
-```go
-tags := surf.QuerySlice(r, "tags")
-// tags = []string{"a", "b", "c"}
-
-// Returns nil if parameter is missing
-categories := surf.QuerySlice(r, "categories")
-if categories == nil {
-    // Parameter not provided
+type SignupBody struct {
+    Name  string `json:"name"`
+    Email string `json:"email"`
 }
-```
 
-## Complete Example
-
-```go
-app.Get("/search", func(w http.ResponseWriter, r *http.Request) error {
-    // Search parameters
-    query := surf.Query(r, "q")
-    category := surf.QueryDefault(r, "category", "all")
-
-    // Pagination
-    page := surf.QueryInt(r, "page", 1)
-    limit := surf.QueryInt(r, "limit", 20)
-
-    // Filters
-    minPrice := surf.QueryFloat(r, "min_price", 0)
-    maxPrice := surf.QueryFloat(r, "max_price", 1000000)
-    inStock := surf.QueryBool(r, "in_stock", false)
-
-    // Multi-value filters
-    tags := surf.QuerySlice(r, "tags")
-    brands := surf.QuerySlice(r, "brands")
-
-    // Use parameters...
-    results := searchProducts(SearchParams{
-        Query:    query,
-        Category: category,
-        Page:     page,
-        Limit:    limit,
-        MinPrice: minPrice,
-        MaxPrice: maxPrice,
-        InStock:  inStock,
-        Tags:     tags,
-        Brands:   brands,
-    })
-
-    return json.NewEncoder(w).Encode(results)
+app.Post("/signup", func(w http.ResponseWriter, r *http.Request) error {
+    var body SignupBody
+    if err := surf.Bind(r, &body); err != nil {
+        return err   // 400 for bad JSON, 413 over limit, 415 wrong type
+    }
+    return surf.JSONDataStatus(w, http.StatusCreated, body)
 })
 ```
 
+`Bind` enforces a 1 MiB body size limit and `Content-Type: application/json`.
+On failure it returns an `*HTTPError` so the handler can just `return err`.
+
+| Failure | Status |
+|---|---|
+| Empty body | 400 |
+| Malformed JSON | 400 |
+| Multiple JSON values | 400 |
+| `Content-Type` not `application/json` | 415 |
+| Over `MaxBodyBytes` | 413 |
+
+### Custom size limit
+
+```go
+err := surf.BindWithLimit(r, &body, 64*1024) // 64 KiB
+```
+
+### Validation hook
+
+If the bound value implements `Validator`, `BindAndValidate` runs it and
+returns a `422 *HTTPError` on failure:
+
+```go
+type SignupBody struct {
+    Name  string `json:"name"`
+    Email string `json:"email"`
+}
+
+func (b SignupBody) Validate() error {
+    if b.Name == "" {
+        return errors.New("name is required")
+    }
+    return nil
+}
+
+app.Post("/signup", func(w http.ResponseWriter, r *http.Request) error {
+    var body SignupBody
+    if err := surf.BindAndValidate(r, &body); err != nil {
+        return err
+    }
+    return surf.JSONDataStatus(w, http.StatusCreated, body)
+})
+```
+
+On the [fast path](/docs/context), `c.Bind` and `c.BindAndValidate` are the
+equivalents.
+
+## JSON Response Envelopes
+
+Standardized response shapes the rest of surf renders into automatically:
+
+```go
+surf.JSON(w, 200, v)                          // raw value
+surf.JSONData(w, v)                           // {"data": v}
+surf.JSONDataStatus(w, 201, v)                // {"data": v} with custom status
+surf.JSONList(w, items, total)                // {"data": [...], "total": n}
+surf.JSONError(w, 404, "not found")           // {"error": "not found", "status": 404}
+```
+
+Every helper sets `Content-Type: application/json; charset=utf-8` and returns
+`error` so it composes with `return`:
+
+```go
+app.Get("/users/:id", func(w http.ResponseWriter, r *http.Request) error {
+    user, err := store.Find(surf.Param(r, "id"))
+    if err != nil {
+        return surf.NewHTTPError(http.StatusNotFound, "user not found")
+    }
+    return surf.JSONData(w, user)
+})
+```
+
+## Query Parameters
+
+Type-safe query-parameter parsing with sensible defaults — invalid values
+fall back to the default; no errors are surfaced.
+
+```go
+name := surf.Query(r, "name")                       // "" if missing
+name := surf.QueryDefault(r, "name", "anonymous")
+
+page := surf.QueryInt(r, "page", 1)
+offset := surf.QueryInt64(r, "offset", 0)
+price := surf.QueryFloat(r, "price", 0.0)
+
+active := surf.QueryBool(r, "active", true)         // accepts true/1/yes/on
+tags := surf.QuerySlice(r, "tags")                  // ?tags=a&tags=b&tags=c
+```
+
+On the fast path, `c.Query(key)` is the equivalent (returns `""` if missing).
+
 ## Redirects
 
-Helper functions for HTTP redirects:
-
-### Generic Redirect
-
 ```go
-// Redirect with any status code
 surf.Redirect(w, r, "/new-location", http.StatusFound)
+surf.RedirectPermanent(w, r, "/new-url")            // 301
+surf.RedirectTemporary(w, r, "/temp-location")      // 302
+surf.RedirectSeeOther(w, r, "/success")             // 303 — after POST
 ```
 
-### Convenience Functions
-
-```go
-// 301 Moved Permanently - for permanent URL changes
-surf.RedirectPermanent(w, r, "/new-url")
-
-// 302 Found - for temporary redirects
-surf.RedirectTemporary(w, r, "/temp-location")
-
-// 303 See Other - use after POST to prevent resubmission
-surf.RedirectSeeOther(w, r, "/success")
-```
-
-### When to Use Each
-
-| Function | Status | Use Case |
-|----------|--------|----------|
-| `RedirectPermanent` | 301 | URL has permanently changed, SEO redirect |
-| `RedirectTemporary` | 302 | Temporary redirect, maintenance page |
-| `RedirectSeeOther` | 303 | After POST/PUT to show result page |
-
-### Example: Post/Redirect/Get Pattern
+The 303 helper is the right choice after a `POST` so the browser doesn't
+resubmit the form on refresh:
 
 ```go
 app.Post("/orders", func(w http.ResponseWriter, r *http.Request) error {
-    // Process order...
     order, err := createOrder(r)
     if err != nil {
         return err
     }
-
-    // Redirect to order confirmation (prevents duplicate submissions)
     surf.RedirectSeeOther(w, r, "/orders/"+order.ID+"/confirmation")
-    return nil
-})
-
-app.Get("/orders/:id/confirmation", func(w http.ResponseWriter, r *http.Request) error {
-    id := surf.Param(r, "id")
-    // Show confirmation page...
     return nil
 })
 ```
 
-## Path Parameters
+## Client IP (proxy-aware)
 
-Extract dynamic path segments:
+`IPFromRequest` returns the client IP. **It ignores `X-Forwarded-For`
+entirely unless the direct peer is in a configured set of trusted proxies** —
+the safe default, since `X-Forwarded-For` is client-controlled.
+
+```go
+// No trusted proxies — peer address is returned. XFF is ignored.
+ip := surf.IPFromRequest(r, nil)
+
+// Behind a load balancer:
+ip := surf.IPFromRequest(r, []string{"10.0.0.0/8", "172.16.0.0/12"})
+```
+
+When the peer matches one of the trusted CIDRs (or bare IPs), surf walks
+`X-Forwarded-For` from the right and returns the first address outside the
+trusted set — the standard correct algorithm.
+
+`KeyByIP(trustedProxies ...)` builds a `func(*http.Request) string` for use
+with rate-limiter keys, custom session stores, etc.
+
+## Path Parameters
 
 ```go
 app.Get("/users/:id/posts/:postId", func(w http.ResponseWriter, r *http.Request) error {
     userID := surf.Param(r, "id")
     postID := surf.Param(r, "postId")
-
-    // Returns empty string if parameter doesn't exist
     return nil
 })
 ```
 
+Returns `""` if the parameter doesn't exist. The wildcard match is available
+as `surf.Param(r, "*")`.
+
 ## Next Steps
 
 <Cards>
-  <Card title="Static Files" href="/docs/static-files">
-    Serve static files and directories
-  </Card>
   <Card title="Error Handling" href="/docs/error-handling">
-    Custom error handlers
+    Returning `*HTTPError`, `Abort`, and custom renderers
+  </Card>
+  <Card title="Static Files" href="/docs/static-files">
+    Static directories, single files, and SPA serving
   </Card>
 </Cards>

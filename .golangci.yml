@@ -1,0 +1,25 @@
+# golangci-lint v2 configuration.
+# Pin the binary version in .github/workflows/ci.yml, not here.
+#
+# This is the conservative starting set. After v0.2.0 cleanups (errcheck on
+# the existing code, removing the dead gzipResponseWriter fields), enable
+# `unused`, `errcheck`, and the full `standard` set.
+
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - govet
+    - staticcheck
+    - ineffassign
+
+  settings:
+    staticcheck:
+      # ST1012: error vars should be named ErrFoo.
+      # surf.Abort is intentionally named without the Err prefix — handlers
+      # read `return surf.Abort` as a sentinel, not as an error to inspect.
+      checks: ["all", "-ST1012"]

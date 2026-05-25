@@ -1,0 +1,106 @@
+---
+title: Metrics
+description: Dependency-free Prometheus exposition middleware
+---
+
+# Metrics
+
+`MetricsRegistry` collects per-request HTTP metrics and exposes them in the
+Prometheus text exposition format. It has **no external dependencies** —
+swap to the official `prometheus/client_golang` later if you outgrow it.
+
+## Setup
+
+```go
+m := surf.NewMetricsRegistry()
+app.Use(m.Middleware())
+app.Get("/metrics", m.Handler())
+```
+
+That's it. Every request the middleware wraps is recorded; `/metrics`
+serves the exposition.
+
+## What gets exported
+
+```
+# HELP surf_http_requests_total Total number of HTTP requests handled.
+# TYPE surf_http_requests_total counter
+surf_http_requests_total{method="GET",status="200"} 142
+surf_http_requests_total{method="GET",status="404"} 3
+surf_http_requests_total{method="POST",status="201"} 17
+
+# HELP surf_http_requests_in_flight Current number of in-flight HTTP requests.
+# TYPE surf_http_requests_in_flight gauge
+surf_http_requests_in_flight 4
+
+# HELP surf_http_request_duration_seconds HTTP request latency in seconds.
+# TYPE surf_http_request_duration_seconds histogram
+surf_http_request_duration_seconds_bucket{le="0.005"} 110
+surf_http_request_duration_seconds_bucket{le="0.01"}  125
+...
+surf_http_request_duration_seconds_bucket{le="+Inf"}  162
+surf_http_request_duration_seconds_sum   1.823
+surf_http_request_duration_seconds_count 162
+```
+
+The histogram uses the same default buckets as the Prometheus Go client
+(`0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10` seconds). Override
+them when latency lives in a different range:
+
+```go
+m := surf.NewMetricsRegistryWithBuckets([]float64{
+    0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1,
+})
+```
+
+## Securing the `/metrics` endpoint
+
+The handler is a normal `surf.HandlerFunc`, so you can guard it like any other
+route — typically with per-route middleware or a separate group:
+
+```go
+ops := app.Group("/ops").Use(requireOpsToken)
+ops.Get("/metrics", m.Handler())
+```
+
+Or bind it to an internal-only listener and serve the rest of the app on a
+public listener — the standard pattern for production deployments.
+
+## Custom labels — not supported
+
+`MetricsRegistry` intentionally exposes a fixed schema (method, status,
+latency, in-flight). It does **not** support custom labels per request,
+because high-cardinality labels (request ID, user ID, raw URL path) are a
+common path to a metrics-server-eating cardinality blowup. If you need
+per-route or per-tenant breakdowns, drop in `prometheus/client_golang` and
+wire your own collector.
+
+## Combining with the rest
+
+```go
+m := surf.NewMetricsRegistry()
+
+app.Use(surf.RecoveryWithDefaults())
+app.Use(m.Middleware())
+app.Use(surf.LoggingMiddlewareWithConfig(surf.LoggingConfig{
+    Format:    "{method} {path} {status} {latency_ms}ms",
+    SkipPaths: []string{"/metrics", "/health/*"},
+}))
+
+app.Get("/healthz", health)
+app.Get("/metrics", m.Handler())
+```
+
+Note `SkipPaths` excluding `/metrics` so the metrics scrape itself does not
+fill the logs.
+
+## Next Steps
+
+<Cards>
+  <Card title="Middleware" href="/docs/middleware">
+    The full middleware suite
+  </Card>
+  <Card title="Performance" href="/docs/performance">
+    Surf's per-request allocation budget
+  </Card>
+</Cards>

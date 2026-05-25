@@ -8,11 +8,16 @@
     "---Core Concepts---",
     "routing",
     "middleware",
+    "error-handling",
+    "context",
+    "services",
     "helpers",
     "---Features---",
     "static-files",
-    "error-handling",
+    "websockets",
+    "metrics",
     "---Reference---",
-    "api-reference"
+    "api-reference",
+    "performance"
   ]
 }

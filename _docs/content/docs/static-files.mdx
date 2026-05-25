@@ -92,41 +92,44 @@ Directory browsing is disabled by default:
 // Response: 404 Not Found (not a directory listing)
 ```
 
-## Complete Example
+## Single Page Application (SPA) Support
+
+`App.SPA` mounts a single-page application from any `fs.FS` — typically an
+`embed.FS` baked into the binary at build time. It handles client-side routing
+fallback (unknown paths serve the index document), long-cache headers for
+fingerprinted assets, and a 404 list for paths that must not fall back to
+HTML.
+
+### Minimal SPA mount
 
 ```go
-package main
-
 import (
-    "net/http"
+    "embed"
+    "io/fs"
+
     "github.com/getangry/surf"
 )
+
+//go:embed all:dist
+var distFS embed.FS
 
 func main() {
     app := surf.NewApp()
 
-    // Serve static assets
-    app.Static("/assets", "./public/assets")
-
-    // Serve specific files
-    app.StaticFile("/favicon.ico", "./public/favicon.ico")
-    app.StaticFile("/robots.txt", "./public/robots.txt")
-
-    // API routes
-    app.Get("/api/users", listUsers)
-
-    // SPA fallback - serve index.html for unmatched routes
-    app.NotFound(func(w http.ResponseWriter, r *http.Request) {
-        http.ServeFile(w, r, "./public/index.html")
-    })
+    sub, _ := fs.Sub(distFS, "dist")
+    app.SPA("/", sub)
+    // - GET / → index.html
+    // - GET /assets/app.js → served with `Cache-Control: public, max-age=31536000, immutable`
+    // - GET /any/client/route → falls back to index.html (200)
 
     app.Serve()
 }
 ```
 
-## Single Page Application (SPA) Support
+### With API routes alongside
 
-For SPAs, serve `index.html` for all non-API routes:
+Register the API first; the SPA mount catches everything else. Use
+`ExcludePrefixes` to 404 unknown API paths instead of serving HTML:
 
 ```go
 app := surf.NewApp()
@@ -136,18 +139,69 @@ api := app.Group("/api")
 api.Get("/users", listUsers)
 api.Get("/posts", listPosts)
 
-// Static assets
-app.Static("/assets", "./dist/assets")
-
-// SPA fallback
-app.NotFound(func(w http.ResponseWriter, r *http.Request) {
-    // Don't serve index.html for API routes
-    if strings.HasPrefix(r.URL.Path, "/api/") {
-        http.Error(w, "Not Found", http.StatusNotFound)
-        return
-    }
-    http.ServeFile(w, r, "./dist/index.html")
+// SPA, with /api/* never falling back to index.html
+app.SPAWithConfig(surf.SPAConfig{
+    Prefix:          "/",
+    FS:              sub,
+    ExcludePrefixes: []string{"api"},
 })
+```
+
+### Full configuration
+
+```go
+type SPAConfig struct {
+    Prefix            string   // URL mount, e.g. "/" or "/app"
+    FS                fs.FS    // filesystem to serve
+    Index             string   // index document (default "index.html")
+    ImmutablePrefixes []string // path segments served with immutable cache (default ["assets"])
+    ExcludePrefixes   []string // path segments that 404 instead of falling back
+}
+```
+
+The handler blocks directory traversal (`path.Clean` + `fs.FS.Open`'s
+`fs.ValidPath` contract), so requests like `/../../etc/passwd` cannot escape
+the served sub-tree.
+
+## Complete Example
+
+```go
+package main
+
+import (
+    "embed"
+    "io/fs"
+
+    "github.com/getangry/surf"
+)
+
+//go:embed all:dist
+var distFS embed.FS
+
+func main() {
+    app := surf.NewApp()
+
+    app.Use(surf.RecoveryWithDefaults())
+
+    // API routes
+    api := app.Group("/api")
+    api.Get("/users", listUsers)
+    api.Get("/posts", listPosts)
+
+    // Serve specific static files
+    app.StaticFile("/robots.txt", "./public/robots.txt")
+
+    // Single-page app — index fallback for client routing,
+    // immutable cache on /assets/*, /api/* returns 404 instead of HTML.
+    sub, _ := fs.Sub(distFS, "dist")
+    app.SPAWithConfig(surf.SPAConfig{
+        Prefix:          "/",
+        FS:              sub,
+        ExcludePrefixes: []string{"api"},
+    })
+
+    app.Serve()
+}
 ```
 
 ## Content Types
