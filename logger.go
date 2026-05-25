@@ -465,6 +465,7 @@ func LoggingMiddleware(format string) Middleware {
 
 			// Wrap the response writer
 			rw := NewResponseWriter(w)
+			rw.StartTime = time.Now()
 
 			// Call next handler with wrapped writer
 			next.ServeHTTP(rw, r)
@@ -515,6 +516,7 @@ func LoggingMiddlewareWithConfig(config LoggingConfig) Middleware {
 			}
 
 			rw := NewResponseWriter(w)
+			rw.StartTime = time.Now()
 			next.ServeHTTP(rw, r)
 
 			entry := &LogEntry{
@@ -682,6 +684,7 @@ func RequestLoggerWithOptions(opts *RequestLoggerOptions) Middleware {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Wrap the response writer
 			rw := NewResponseWriter(w)
+			rw.StartTime = time.Now()
 
 			// Call next handler with wrapped writer
 			next.ServeHTTP(rw, r)
@@ -770,6 +773,7 @@ func SlogMiddlewareWithLevel(logger *slog.Logger, level slog.Level) Middleware {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Wrap the response writer
 			rw := NewResponseWriter(w)
+			rw.StartTime = time.Now()
 
 			// Call next handler with wrapped writer
 			next.ServeHTTP(rw, r)
@@ -806,6 +810,7 @@ func ReefCompatibleMiddleware(logger *slog.Logger) Middleware {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Wrap the response writer
 			rw := NewResponseWriter(w)
+			rw.StartTime = time.Now()
 
 			// Call next handler with wrapped writer
 			next.ServeHTTP(rw, r)
@@ -842,6 +847,7 @@ func CombinedMiddleware(format string, slogger *slog.Logger) Middleware {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Wrap the response writer
 			rw := NewResponseWriter(w)
+			rw.StartTime = time.Now()
 
 			// Call next handler with wrapped writer
 			next.ServeHTTP(rw, r)

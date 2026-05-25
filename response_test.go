@@ -61,27 +61,36 @@ func TestResponseWriterImplicitWriteHeader(t *testing.T) {
 	}
 }
 
-func TestResponseWriterLatency(t *testing.T) {
+func TestResponseWriterLatencyZeroWhenUnset(t *testing.T) {
 	rec := httptest.NewRecorder()
 	rw := NewResponseWriter(rec)
+	// StartTime is not set by NewResponseWriter; callers opt in.
+	if got := rw.Latency(); got != 0 {
+		t.Errorf("Latency() with unset StartTime = %v, want 0", got)
+	}
+}
+
+func TestResponseWriterLatencyAfterStartTimeSet(t *testing.T) {
+	rec := httptest.NewRecorder()
+	rw := NewResponseWriter(rec)
+	rw.StartTime = time.Now()
 
 	time.Sleep(10 * time.Millisecond)
 	latency := rw.Latency()
-
 	if latency < 10*time.Millisecond {
 		t.Errorf("latency = %v, want >= 10ms", latency)
 	}
 }
 
-func TestResponseWriterStartTime(t *testing.T) {
-	before := time.Now()
+func TestResponseWriterStartTimeField(t *testing.T) {
 	rec := httptest.NewRecorder()
 	rw := NewResponseWriter(rec)
-	after := time.Now()
 
-	startTime := rw.StartTime()
-	if startTime.Before(before) || startTime.After(after) {
-		t.Errorf("start time %v not between %v and %v", startTime, before, after)
+	// Field is exported and settable; reads back the same value.
+	before := time.Now()
+	rw.StartTime = before
+	if rw.StartTime != before {
+		t.Errorf("StartTime field read = %v, want %v", rw.StartTime, before)
 	}
 }
 
