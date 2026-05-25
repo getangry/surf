@@ -47,7 +47,10 @@ jobs:
         with:
           # Pin the linter binary version explicitly; not "latest".
           version: v2.12.2
-          args: --timeout=5m
+          # Explicit package list. Skips example/ (which has multiple
+          # package-main files — pre-existing build problem) and benchmarks/
+          # (separate module).
+          args: --timeout=5m . ./pkg/...
 
       - name: go test
-        run: go test -race -count=1 .
+        run: go test -race -count=1 . ./pkg/...
