@@ -1,7 +1,12 @@
 name: CI
 
 on:
+  # Branch protection requires a PR to merge into main, so the push trigger
+  # only ever fires on the merge commit itself. Scoping it to main here
+  # avoids a duplicate run on every branch push that also has an open PR
+  # (which the pull_request trigger already covers).
   push:
+    branches: [main]
   pull_request:
     branches: [main]
 
