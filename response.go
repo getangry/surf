@@ -111,9 +111,19 @@ func (rw *ResponseWriter) Size() int {
 	return rw.size
 }
 
-// Written returns whether the response has been written
+// Written returns whether the response body has been written. A response
+// can have headers committed (status line sent) without a body — see
+// Committed.
 func (rw *ResponseWriter) Written() bool {
 	return rw.written
+}
+
+// Committed reports whether the response has started being sent — that is,
+// whether WriteHeader or Write has been called. The error renderer consults
+// this before writing an error response so a partially-sent response is
+// never corrupted.
+func (rw *ResponseWriter) Committed() bool {
+	return rw.wroteHeader || rw.written
 }
 
 // Latency returns the elapsed time since StartTime, or 0 if StartTime was

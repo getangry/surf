@@ -306,3 +306,45 @@ func TestResponseSize(t *testing.T) {
 		t.Errorf("ResponseSize = %d, want 5", size)
 	}
 }
+
+func TestResponseWriterCommitted(t *testing.T) {
+	t.Run("fresh writer is not committed", func(t *testing.T) {
+		rw := NewResponseWriter(httptest.NewRecorder())
+		if rw.Committed() {
+			t.Error("fresh writer must not report Committed")
+		}
+	})
+
+	t.Run("WriteHeader commits", func(t *testing.T) {
+		rw := NewResponseWriter(httptest.NewRecorder())
+		rw.WriteHeader(http.StatusCreated)
+		if !rw.Committed() {
+			t.Error("WriteHeader should mark the writer Committed")
+		}
+	})
+
+	t.Run("Write commits (implicit WriteHeader)", func(t *testing.T) {
+		rw := NewResponseWriter(httptest.NewRecorder())
+		_, _ = rw.Write([]byte("ok"))
+		if !rw.Committed() {
+			t.Error("Write should mark the writer Committed")
+		}
+	})
+}
+
+func TestRenderErrorPreservesCommittedResponse(t *testing.T) {
+	// A handler that writes a 200 and THEN returns a generic error must keep
+	// its response intact — the renderer must consult Committed.
+	app := NewApp()
+	app.Get("/x", func(w http.ResponseWriter, r *http.Request) error {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("kept"))
+		return errExample
+	})
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, httptest.NewRequest("GET", "/x", nil))
+	if rec.Code != http.StatusOK || rec.Body.String() != "kept" {
+		t.Errorf("renderError corrupted a committed response: code=%d body=%q",
+			rec.Code, rec.Body.String())
+	}
+}

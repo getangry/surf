@@ -494,7 +494,7 @@ func (app *App) renderError(rw *ResponseWriter, r *http.Request, err error, cont
 	)
 
 	// The handler already produced a response; writing again would corrupt it.
-	if rw.wroteHeader || rw.written {
+	if rw.Committed() {
 		return
 	}
 
