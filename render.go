@@ -12,7 +12,7 @@ const jsonContentType = "application/json; charset=utf-8"
 // Content-Type header and returns any encoding error so a handler can simply
 // `return surf.JSON(w, 200, v)`.
 func JSON(w http.ResponseWriter, status int, v any) error {
-	w.Header().Set("Content-Type", jsonContentType)
+	setKnownHeader(w.Header(), headerContentType, jsonContentType)
 	w.WriteHeader(status)
 	return json.NewEncoder(w).Encode(v)
 }

@@ -29,8 +29,9 @@ type MiddlewareFunc func(w http.ResponseWriter, r *http.Request, next http.Handl
 
 // Router handles HTTP routing with path parameters
 type Router struct {
-	routes map[string]map[string]*route // Legacy map storage
-	trees  map[string]*radixTree        // Radix trees per method for fast lookup
+	routes    map[string]map[string]*route // Legacy map storage
+	trees     map[string]*radixTree        // Radix trees per method for fast lookup
+	routeInfo []RouteInfo                  // Registration-time metadata; read by App.Routes()
 }
 
 // Group represents a route group with a common prefix and middleware
@@ -103,6 +104,12 @@ func (r *Router) addRoute(method, pattern string, handler HandlerFunc, middlewar
 	}
 	r.routes[method][pattern] = rt
 	r.trees[method].insert(pattern, rt)
+	r.routeInfo = append(r.routeInfo, RouteInfo{
+		Method:  method,
+		Pattern: pattern,
+		Params:  params,
+		Style:   StyleStandard,
+	})
 }
 
 // addCtxRoute registers a fast-path Context route.
@@ -119,14 +126,21 @@ func (r *Router) addCtxRoute(method, pattern string, handler CtxHandler, middlew
 			"pattern", pattern,
 		)
 	}
+	params := extractParams(pattern)
 	rt := &route{
 		pattern:        pattern,
-		params:         extractParams(pattern),
+		params:         params,
 		ctxHandler:     handler,
 		ctxMiddlewares: middleware,
 	}
 	r.routes[method][pattern] = rt
 	r.trees[method].insert(pattern, rt)
+	r.routeInfo = append(r.routeInfo, RouteInfo{
+		Method:  method,
+		Pattern: pattern,
+		Params:  params,
+		Style:   StyleContext,
+	})
 }
 
 // Get registers a GET route. Any middleware is applied to this route only,
@@ -350,6 +364,12 @@ func (g *Group) addRoute(method, pattern string, handler HandlerFunc, routeMiddl
 
 	g.app.router.routes[method][fullPattern] = rt
 	g.app.router.trees[method].insert(fullPattern, rt)
+	g.app.router.routeInfo = append(g.app.router.routeInfo, RouteInfo{
+		Method:  method,
+		Pattern: fullPattern,
+		Params:  rt.params,
+		Style:   StyleStandard,
+	})
 }
 
 // ServeHTTP implements the http.Handler interface.
@@ -407,7 +427,7 @@ func (app *App) dispatch(w http.ResponseWriter, r *http.Request) {
 // serveNoRoute writes the 405 or 404 response for an unmatched request.
 func (app *App) serveNoRoute(w http.ResponseWriter, r *http.Request) {
 	if allowed := app.router.getAllowedMethods(r.URL.Path); len(allowed) > 0 {
-		w.Header().Set("Allow", strings.Join(allowed, ", "))
+		setKnownHeader(w.Header(), headerAllow, strings.Join(allowed, ", "))
 		if app.methodNotAllowed != nil {
 			app.methodNotAllowed(w, r)
 		} else {

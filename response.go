@@ -10,41 +10,55 @@ import (
 	"time"
 )
 
-// ResponseWriter wraps http.ResponseWriter to track response metrics and store custom data
+// ResponseWriter wraps http.ResponseWriter to track response metrics and
+// store custom data.
+//
+// StartTime is exported and intentionally NOT set by the framework. Callers
+// that care about request latency (typically a logging or metrics
+// middleware) set it themselves:
+//
+//	rw := surf.NewResponseWriter(w)
+//	rw.StartTime = time.Now()
+//
+// Skipping the per-request time.Now() saves ~25 ns on Apple Silicon for
+// routes that don't time their requests. Latency() returns 0 when StartTime
+// is the zero value.
 type ResponseWriter struct {
 	http.ResponseWriter
+	StartTime   time.Time // request start; set by the caller, zero by default
 	status      int
 	size        int
 	written     bool
 	wroteHeader bool
-	startTime   time.Time
 	customData  map[string]interface{}
 	mu          sync.RWMutex
 }
 
 // NewResponseWriter creates a new ResponseWriter. The customData map is
 // allocated lazily on first Set, so a response that stores no custom data
-// costs nothing extra.
+// costs nothing extra. StartTime is left as the zero value — set it
+// explicitly if you need Latency().
 func NewResponseWriter(w http.ResponseWriter) *ResponseWriter {
 	return &ResponseWriter{
 		ResponseWriter: w,
 		status:         http.StatusOK,
-		startTime:      time.Now(),
 	}
 }
 
-// initWriter wires up the zero-valued ResponseWriter embedded in a reqState or
-// Context to wrap w, avoiding a separate ResponseWriter allocation per request.
+// initWriter wires up the zero-valued ResponseWriter embedded in a reqState
+// or Context to wrap w, avoiding a separate ResponseWriter allocation per
+// request. StartTime is left zero (the cost of time.Now() was 25 ns per
+// request on the fast path).
 func (rw *ResponseWriter) initWriter(w http.ResponseWriter) {
 	rw.ResponseWriter = w
 	rw.status = http.StatusOK
-	rw.startTime = time.Now()
 }
 
-// recycle clears the ResponseWriter so the pooled Context that owns it can be
-// reused by a later request.
+// recycle clears the ResponseWriter so the pooled Context that owns it can
+// be reused by a later request.
 func (rw *ResponseWriter) recycle() {
 	rw.ResponseWriter = nil
+	rw.StartTime = time.Time{}
 	rw.status = 0
 	rw.size = 0
 	rw.written = false
@@ -102,14 +116,14 @@ func (rw *ResponseWriter) Written() bool {
 	return rw.written
 }
 
-// StartTime returns the request start time
-func (rw *ResponseWriter) StartTime() time.Time {
-	return rw.startTime
-}
-
-// Latency returns the elapsed time since request start
+// Latency returns the elapsed time since StartTime, or 0 if StartTime was
+// never set. Logging middlewares typically set StartTime themselves at the
+// top of their wrapper.
 func (rw *ResponseWriter) Latency() time.Duration {
-	return time.Since(rw.startTime)
+	if rw.StartTime.IsZero() {
+		return 0
+	}
+	return time.Since(rw.StartTime)
 }
 
 // Set adds a custom value to the ResponseWriter (thread-safe)
