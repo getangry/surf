@@ -2,6 +2,83 @@
 
 All notable changes to Surf are documented in this file.
 
+## v0.2.0
+
+A performance release that closes most of the gap to gin and echo on the
+fast path, plus three additive feature areas (lazy Context accessors, route
+introspection, typed handlers). Every performance number in this section is
+measured on Apple Silicon with `benchmarks/` (3-run median); re-bench on
+your target hardware.
+
+### Added
+
+- **Lazy Context accessors.** `Cookies()`, `Cookie(name)`, `QueryValues()`
+  on `*Context`. Each is `sync.Once`-gated and shares a parsed map across
+  repeated calls. `c.Query(key)` now reads through the cached map instead of
+  re-parsing per call. Routes that never call these accessors pay nothing
+  beyond the slightly larger struct (measured cost when unused: 0.1 ns,
+  within noise).
+- **Route metadata introspection.** `App.Routes() []RouteInfo` returns a
+  snapshot of every registered route — Method, Pattern, Params, Style
+  (`StyleStandard` vs `StyleContext`), and (for typed handlers) the request
+  and response `reflect.Type`. Captured at registration; zero per-request
+  cost. Enables a future `surf/openapi` package to emit OpenAPI 3.1 by
+  walking the type info.
+- **Typed handlers.** Three new generic registrations:
+  - `surf.HandleJSON[Req, Resp](app, method, pattern, fn, mw...)` — the
+    framework runs `Bind → Validator → call → JSON encode`.
+  - `surf.HandleJSONStatus[Req, Resp]` — same, with a custom success status.
+  - `surf.HandleQuery[Resp]` — typed response, no request body.
+
+  Each captures the `Req`/`Resp` types into `RouteInfo` for introspection.
+
+### Changed
+
+- **`ResponseWriter.StartTime` is now an exported field** instead of being
+  set automatically by `initWriter` / `NewResponseWriter`. Each built-in
+  logging middleware sets it itself at the top of its wrapper, so existing
+  template formats (`{latency_ms}`) and `RequestLogger` continue to work
+  unchanged for users of those middlewares.
+- **`Latency()` returns `0` when `StartTime` is the zero value** (the new
+  default) instead of `time.Since(some-default)`.
+- **Removed: `ResponseWriter.StartTime()` method.** It collided with the
+  new field name. Replace `rw.StartTime()` calls with `rw.StartTime`.
+
+The `time.Now()` removal saves ~25 ns per request on Apple Silicon for
+routes that don't time their requests. `SimpleLogger` (the After-handler
+variant) will see zero latency unless a Before-handler sets `rw.StartTime`.
+
+### Performance
+
+Cross-framework benchmark (`benchmarks/`, Apple Silicon, Go 1.26, 3-run
+median, ns/op / allocs/op):
+
+| Router | Static | Param |
+|---|---|---|
+| `net/http.ServeMux` | 29 / 1 | 77 / 2 |
+| gin | 47 / 1 | 54 / 1 |
+| echo | 47 / 1 | 57 / 1 |
+| **surf-fast (v0.2.0)** | **55 / 2** | **62 / 2** |
+| surf-fast (v0.1.0) | 89 / 2 | 100 / 2 |
+| chi | 99 / 3 | 195 / 5 |
+| surf standard (v0.2.0) | 122 / 3 | 138 / 3 |
+| surf standard (v0.1.0) | 145 / 3 | 167 / 3 |
+
+surf-fast static is ~38% faster than v0.1.0, surf-fast param is ~38% faster.
+surf-fast beats chi by ~2× on static and ~3× on param. surf-fast beats stdlib
+`ServeMux` on the param route by ~24%. gin and echo remain 10–15% faster.
+
+### Performance changes by commit
+
+- Canonical header table — bypass `CanonicalMIMEHeaderKey` for headers surf
+  itself writes (Content-Type, Vary, Content-Encoding, Allow, X-Request-Id,
+  Retry-After). Measured: −9.8 ns static, −11.6 ns param.
+- Drop `time.Now()` from `initWriter`. Logging middleware sets it itself.
+  Measured: −23.8 ns static, −24.5 ns param.
+- Radix tree: split children into typed slots (`staticChildren`,
+  `paramChild`, `wildcardChild`) so search avoids the per-node type filter.
+  Measured: −1 to −3 ns per lookup depending on depth.
+
 ## v0.1.0
 
 A feature release that closes long-standing framework gaps. **All changes are
