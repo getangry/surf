@@ -41,6 +41,15 @@ All notable changes to Surf are documented in this file.
   `ClusterSizer`), keeping the cluster-wide rate near the configured value.
   Off by default; the non-distributed limiter is unchanged.
 
+- **Redis backplane** (`redisbackplane` subpackage): a strongly-consistent
+  `Backplane` implementation over Redis, the alternative to the peer-to-peer
+  gossip backend. Because Redis is a single source of truth, its lease provides
+  a *reliable* fencing token (`INCR`, globally monotonic) — the contrast with
+  the gossip lease's colliding tokens. KV via `SET`/`GET`/`DEL` with TTL; lease
+  via `SET NX` + owner-checked Lua for renew/release; optional AES-256-GCM value
+  encryption (`WithEncryption`). Speaks RESP over a stdlib socket, so it adds no
+  third-party dependency. Handler code is identical against either backend.
+
 ### Changed
 
 - **Per-request storage (`Store`/`Set`/`Get`/`Delete`) now uses the per-request

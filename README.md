@@ -440,6 +440,32 @@ defer lease.Release(ctx)
 >
 > *(Reproduce these numbers: `go test -tags eval -run TestEval -v .`)*
 
+### Redis backend — when you need a real lease
+
+`Backplane` is an interface, so the gossip backend is not your only option. The
+`redisbackplane` subpackage implements it against Redis, which **is** a single
+source of truth — so unlike the gossip lease, its fencing token comes from a
+Redis `INCR` (atomic, globally monotonic) and a downstream resource can reliably
+reject stale holders. Use it when you actually need correctness-grade
+coordination (still pair the token with the resource; a Sentinel/Cluster
+failover can drop a held lease — the Redlock caveat).
+
+```go
+import "github.com/getangry/surf/redisbackplane"
+
+bp, err := redisbackplane.New("localhost:6379",
+    redisbackplane.WithKeyPrefix("surf:"),
+    redisbackplane.WithEncryption([]byte(os.Getenv("SURF_KV_SECRET"))), // optional AES-256-GCM
+)
+app := surf.NewApp(surf.WithBackplane(bp))
+```
+
+It speaks RESP over a stdlib socket, so it adds **no third-party dependency**.
+The same handler code (`KV[T]`, `Lease`, etc.) works against either backend —
+swap the backplane, keep the call sites. Pick gossip for "no new infra",
+eventually-consistent shared state; pick Redis for stronger consistency and a
+trustworthy fencing token.
+
 ### Approximate distributed rate limiting
 
 The built-in rate limiter can spread a global budget across instances. Set
