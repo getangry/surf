@@ -209,6 +209,20 @@ type RateLimitConfig struct {
 
 	// SkipFunc returns true if the request should skip rate limiting
 	SkipFunc func(r *http.Request) bool
+
+	// Distributed spreads the limit across instances. When true and Backplane
+	// implements ClusterSizer, the effective per-instance rate and burst are the
+	// configured values divided by the number of live instances, so the
+	// cluster-wide rate stays near the configured value regardless of replica
+	// count. This is approximate: each instance limits to its own share, so
+	// bursts can be uneven across instances and a network partition lets each
+	// side use a full local share. When Backplane is nil or is not a
+	// ClusterSizer, behavior is identical to the non-distributed limiter.
+	Distributed bool
+
+	// Backplane supplies the live instance count for Distributed mode. Pass
+	// app.Backplane(). Ignored when Distributed is false.
+	Backplane Backplane
 }
 
 // tokenBucket implements a simple token bucket rate limiter
@@ -246,6 +260,19 @@ func (tb *tokenBucket) allow() bool {
 		return true
 	}
 	return false
+}
+
+// setLimits updates the bucket's rate and burst, capping any accumulated
+// tokens to the new burst. Used by distributed rate limiting to retune the
+// per-instance share as the live instance count changes.
+func (tb *tokenBucket) setLimits(rate float64, burst float64) {
+	tb.mu.Lock()
+	defer tb.mu.Unlock()
+	tb.rate = rate
+	tb.burst = burst
+	if tb.tokens > burst {
+		tb.tokens = burst
+	}
 }
 
 // rateLimiterStore stores rate limiters per client
@@ -325,6 +352,14 @@ func RateLimit(config RateLimitConfig) Middleware {
 
 	store := newRateLimiterStore(config.RequestsPerSecond, config.Burst)
 
+	// In distributed mode the per-instance share is the configured rate/burst
+	// divided by the live instance count. sizer is nil unless a ClusterSizer
+	// backplane was supplied, in which case the non-distributed path is used.
+	var sizer ClusterSizer
+	if config.Distributed && config.Backplane != nil {
+		sizer, _ = config.Backplane.(ClusterSizer)
+	}
+
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			// Check if request should skip rate limiting
@@ -335,6 +370,18 @@ func RateLimit(config RateLimitConfig) Middleware {
 
 			key := config.KeyFunc(r)
 			limiter := store.get(key)
+
+			if sizer != nil {
+				n := sizer.Size()
+				if n < 1 {
+					n = 1
+				}
+				burst := config.Burst / n
+				if burst < 1 {
+					burst = 1
+				}
+				limiter.setLimits(config.RequestsPerSecond/float64(n), float64(burst))
+			}
 
 			if !limiter.allow() {
 				if config.ExceededHandler != nil {

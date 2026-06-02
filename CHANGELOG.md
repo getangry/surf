@@ -2,6 +2,54 @@
 
 All notable changes to Surf are documented in this file.
 
+## Unreleased
+
+### Added
+
+- **Backplane** — shared state across instances with no external datastore.
+  When Surf runs across many pods/tasks, process-local state (sessions,
+  idempotency keys, caches) diverges without session affinity. The new
+  `Backplane` interface exposes a TTL key/value store and advisory leases;
+  `app.Backplane()` is always available, defaulting to an in-process `Local`
+  backend.
+  - `surf.NewClusterBackplane(secret, discoverer, opts...)` is a peer-to-peer,
+    eventually-consistent backend: nodes gossip membership (SWIM-lite with
+    incarnation numbers and indirect probing), replicate writes (HLC + LWW +
+    tombstones), and converge via anti-entropy. Pure standard library — no new
+    dependencies, no Redis/Memcached.
+  - **Security**: one shared cluster secret derives, via HKDF, separate keys
+    that AES-256-GCM encrypt and authenticate both stored values (at rest on
+    every replica) and all peer traffic. Per-connection keys plus a key-epoch
+    byte give replay protection and a path to key rotation.
+  - **Discovery**: `surf.K8sHeadless(service, namespace, port)` (Kubernetes
+    headless-service DNS) and `surf.StaticPeers(addrs...)` (ECS/VMs), behind a
+    pluggable `Discoverer`.
+  - **Advisory leases** (`Lease`/`TryLease`) with an auto-expiring TTL and a
+    fencing token. Deliberately named "lease", not "lock": they are best-effort
+    and **not partition-safe**. An evaluation harness (`go test -tags eval -run
+    TestEval`) measures a symmetric two-node partition double-granting a key
+    100% of the time, with fencing tokens colliding 100% of the time. Safe to
+    duplicate; never use to guard non-idempotent side effects (use a real
+    coordinator behind the interface for those).
+  - `surf.NewKV[T]` is a typed view over the store; `ClusterSizer` exposes the
+    live instance count for building approximate distributed rate limiters.
+  - Wired into the app: `surf.WithBackplane(bp)` option, `Context.Backplane()`,
+    and `surf.BackplaneFromRequest(r)`. A clustered backend's goroutines bind to
+    the app context and stop on shutdown.
+- **Distributed rate limiting**: `RateLimitConfig.Distributed` + `Backplane`
+  divide the configured rate/burst by the live instance count (via
+  `ClusterSizer`), keeping the cluster-wide rate near the configured value.
+  Off by default; the non-distributed limiter is unchanged.
+
+### Changed
+
+- **Per-request storage (`Store`/`Set`/`Get`/`Delete`) now uses the per-request
+  `reqState`** for requests handled by surf, instead of a process-global map.
+  Values are freed with the request and no longer take a global lock on the hot
+  path. Requests that never passed through surf's `ServeHTTP` (e.g. bare
+  `httptest` requests) transparently fall back to the previous global map, so
+  existing behavior is preserved.
+
 ## v0.2.1
 
 A small additive release picking up ideas from two superseded community PRs

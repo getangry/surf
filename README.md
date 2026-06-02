@@ -10,6 +10,7 @@ A lightweight, high-performance HTTP web framework for Go with flexible middlewa
 - **Error-returning handlers**: a returned error is rendered to the client by a configurable renderer
 - **Built-in Middleware**: CORS, Recovery, Rate Limiting, Timeout, Gzip compression
 - **Typed service container**: register and resolve dependencies by type
+- **Backplane**: share KV state (and advisory leases) across instances (pods/tasks) peer-to-peer, encrypted, with no external datastore
 - **Request binding & validation**: JSON body binding with size limits and a `Validator` hook
 - **JSON response envelopes**: `JSON`, `JSONData`, `JSONList`, `JSONError` helpers
 - **SPA serving**: single-page-app handler with `embed.FS` support and asset caching
@@ -371,6 +372,101 @@ userID := surf.Get(r, "user_id").(string)
 operation := surf.GetString(r, "operation")
 ```
 
+## Backplane: shared state across instances
+
+When Surf runs across many pods (Kubernetes) or tasks (ECS), each instance has
+its own process memory. Anything kept in a `sync.Mutex` or a local map —
+sessions, idempotency keys, rate-limiter state, soft caches — diverges between
+instances, so a client whose requests land on different pods sees inconsistent
+behavior unless you pin it with session affinity.
+
+The **Backplane** removes that need. It shares two primitives across instances:
+
+- a **key/value store** with per-key TTL (`Get`/`Set`/`Delete`), and
+- **advisory leases** with an auto-expiring TTL (best-effort, *not* a lock — see below).
+
+There is no external datastore to operate. Instances coordinate **peer-to-peer**
+over an encrypted gossip protocol, discovering each other via Kubernetes
+headless-service DNS or a static peer list. Everything is pure Go standard
+library — Surf keeps its zero-dependency guarantee.
+
+### Default (single instance)
+
+`app.Backplane()` is always available. With no configuration it is an in-process
+`Local` backend — correct for one replica, tests, and local development:
+
+```go
+app := surf.NewApp()
+
+type Session struct{ UserID string; Roles []string }
+sessions := surf.NewKV[Session](app.Backplane(), "sess:")
+
+sessions.Set(ctx, sid, Session{UserID: "u-42", Roles: []string{"admin"}}, 30*time.Minute)
+s, ok, _ := sessions.Get(ctx, sid)
+```
+
+### Clustered (many instances)
+
+Pass a clustered backend; the same code now shares state across pods. `NewApp`
+starts the node and `Serve`/`Cleanup` stop it.
+
+```go
+secret := []byte(os.Getenv("SURF_CLUSTER_SECRET")) // from a Kubernetes Secret
+
+bp := surf.NewClusterBackplane(
+    secret,
+    surf.K8sHeadless("surf-headless", "default", 7946), // or surf.StaticPeers("10.0.0.1:7946", ...)
+    surf.WithClusterBindAddr(":7946"),
+)
+app := surf.NewApp(surf.WithBackplane(bp))
+```
+
+The single shared `secret` is used (via HKDF-derived subkeys) to AES-256-GCM
+encrypt and authenticate both stored values and all peer traffic. A leaked
+secret compromises the whole cluster; there is no per-peer identity.
+
+### Advisory leases (NOT locks)
+
+```go
+lease, err := app.Backplane().Lease(ctx, "refresh-the-cache", 15*time.Second)
+if err != nil { /* ... */ }
+defer lease.Release(ctx)
+// hold the lease while doing work that is merely wasteful to duplicate
+```
+
+> ⚠️ **A `Lease` is a coordination hint, not mutual exclusion.** It holds one owner only while cluster membership is stable. Under a network partition it fails *completely*: measured over the test harness, a symmetric two-node split **double-grants the same key 100% of the time**, and the fencing token (`lease.Token()`) **collides 100% of the time**, so it cannot even tiebreak the two holders — globally-monotonic tokens require consensus, which this backend doesn't have.
+>
+> Use a lease for work that's only *wasteful* to duplicate (deduplicating a background job, electing a soft primary for a cache refresh). **Never** use it to guard money, inventory, or any non-idempotent side effect. For those, point the `Backplane` at a real coordinator (etcd/Consul). The KV store, by contrast, is **eventually consistent** (last-write-wins) and well-suited to sessions, idempotency keys, and caches.
+>
+> *(Reproduce these numbers: `go test -tags eval -run TestEval -v .`)*
+
+### Approximate distributed rate limiting
+
+The built-in rate limiter can spread a global budget across instances. Set
+`Distributed` and pass the backplane; the effective per-instance rate and burst
+become the configured values divided by the live instance count:
+
+```go
+app.Use(surf.RateLimit(surf.RateLimitConfig{
+    RequestsPerSecond: 1000, // cluster-wide budget
+    Burst:             2000,
+    Distributed:       true,
+    Backplane:         app.Backplane(),
+}))
+```
+
+It is approximate (each instance limits to its own share, so a partition lets
+each side use a full local share). To build your own, read the live count
+directly — a clustered backplane implements `ClusterSizer`:
+
+```go
+n := 1
+if cs, ok := app.Backplane().(surf.ClusterSizer); ok {
+    n = cs.Size()
+}
+perInstanceRate := globalRate / float64(n)
+```
+
 ## v0.1.0 Features
 
 ### Per-Route and Per-Group Middleware
@@ -575,7 +671,7 @@ See `example/main.go` for a complete example with:
 
 ### Structured Logging
 
-See `example/slog_demo.go` for structured logging with:
+See `example/slog/` for structured logging with:
 - slog integration
 - Reef package compatibility
 - JSON output format
@@ -583,7 +679,7 @@ See `example/slog_demo.go` for structured logging with:
 
 ### Service Container
 
-See `example/services_demo.go` for dependency injection with:
+See `example/services/` for dependency injection with:
 - Service registration and retrieval
 - Type-safe service access with generics
 - Database and service layer examples

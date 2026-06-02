@@ -20,7 +20,10 @@ var logTemplateRegex = regexp.MustCompile(`\{([^}]+)\}`)
 
 // Logger context helpers
 
-// Global storage for request context values with thread safety
+// Global storage for request context values, used only as a fallback for
+// requests that did not pass through surf's ServeHTTP (and therefore have no
+// reqState). Requests handled by surf store their values in the per-request
+// reqState instead, which is freed with the request and needs no global lock.
 var (
 	requestStorage = make(map[*http.Request]map[string]interface{})
 	storageMutex   sync.RWMutex
@@ -28,20 +31,19 @@ var (
 
 // Set adds a value to the request storage (framework limitation workaround)
 func Set(r **http.Request, key string, value interface{}) {
-	storageMutex.Lock()
-	defer storageMutex.Unlock()
-
-	if requestStorage[*r] == nil {
-		requestStorage[*r] = make(map[string]interface{})
-	}
-	requestStorage[*r][key] = value
+	Store(*r, key, value)
 }
 
 // SetMultiple adds multiple values at once to request storage
 func SetMultiple(r **http.Request, values map[string]interface{}) {
+	if st := stateFromRequest(*r); st != nil {
+		for key, value := range values {
+			st.setData(key, value)
+		}
+		return
+	}
 	storageMutex.Lock()
 	defer storageMutex.Unlock()
-
 	if requestStorage[*r] == nil {
 		requestStorage[*r] = make(map[string]interface{})
 	}
@@ -52,9 +54,12 @@ func SetMultiple(r **http.Request, values map[string]interface{}) {
 
 // Store directly sets a value for a request (internal use)
 func Store(r *http.Request, key string, value interface{}) {
+	if st := stateFromRequest(r); st != nil {
+		st.setData(key, value)
+		return
+	}
 	storageMutex.Lock()
 	defer storageMutex.Unlock()
-
 	if requestStorage[r] == nil {
 		requestStorage[r] = make(map[string]interface{})
 	}
@@ -63,17 +68,23 @@ func Store(r *http.Request, key string, value interface{}) {
 
 // Get retrieves a value from the request storage or context
 func Get(r *http.Request, key string) (interface{}, bool) {
-	// First check our global storage with read lock
-	storageMutex.RLock()
-	if storage, exists := requestStorage[r]; exists {
-		if val, ok := storage[key]; ok {
-			storageMutex.RUnlock()
+	if st := stateFromRequest(r); st != nil {
+		if val, ok := st.getData(key); ok {
 			return val, true
 		}
+	} else {
+		// Fallback storage for non-surf requests.
+		storageMutex.RLock()
+		if storage, exists := requestStorage[r]; exists {
+			if val, ok := storage[key]; ok {
+				storageMutex.RUnlock()
+				return val, true
+			}
+		}
+		storageMutex.RUnlock()
 	}
-	storageMutex.RUnlock()
 
-	// Fallback to context
+	// Fallback to context (e.g. values set by RequestIDMiddleware).
 	val := r.Context().Value(contextKey(key))
 	return val, val != nil
 }
@@ -88,8 +99,14 @@ func GetString(r *http.Request, key string, defaultVal string) string {
 	return defaultVal
 }
 
-// Delete removes a request from storage
+// Delete removes a request's stored values. For surf-handled requests the data
+// lives in the reqState and is freed automatically, so Delete is only required
+// for the non-surf fallback path; calling it is always safe.
 func Delete(r *http.Request) {
+	if st := stateFromRequest(r); st != nil {
+		st.clearData()
+		return
+	}
 	storageMutex.Lock()
 	defer storageMutex.Unlock()
 	delete(requestStorage, r)

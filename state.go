@@ -3,6 +3,7 @@ package surf
 import (
 	"context"
 	"net/http"
+	"sync"
 )
 
 // stateKey is the single context key under which per-request framework state
@@ -41,6 +42,38 @@ type reqState struct {
 	rw              ResponseWriter
 	params          []paramKV
 	paramsBuf       [inlineParams]paramKV
+
+	// data holds per-request key/value storage written via Store/Set/Get. It
+	// lives here rather than in a global map so it is freed with the request
+	// and needs no process-wide lock. Lazily allocated; guarded by dataMu
+	// because Timeout middleware can run the handler in a separate goroutine.
+	dataMu sync.Mutex
+	data   map[string]any
+}
+
+// setData stores a per-request value.
+func (st *reqState) setData(key string, value any) {
+	st.dataMu.Lock()
+	defer st.dataMu.Unlock()
+	if st.data == nil {
+		st.data = make(map[string]any)
+	}
+	st.data[key] = value
+}
+
+// getData retrieves a per-request value.
+func (st *reqState) getData(key string) (any, bool) {
+	st.dataMu.Lock()
+	defer st.dataMu.Unlock()
+	v, ok := st.data[key]
+	return v, ok
+}
+
+// clearData drops all per-request values.
+func (st *reqState) clearData() {
+	st.dataMu.Lock()
+	st.data = nil
+	st.dataMu.Unlock()
 }
 
 // Value returns the reqState itself for stateKey, delegating everything else

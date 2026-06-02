@@ -40,17 +40,17 @@ jobs:
           fi
 
       - name: go vet
-        run: go vet .
+        run: go vet ./...
 
       - name: golangci-lint
         uses: golangci/golangci-lint-action@82606bf257cbaff209d206a39f5134f0cfbfd2ee # v9.2.1
         with:
           # Pin the linter binary version explicitly; not "latest".
           version: v2.12.2
-          # Explicit package list. Skips example/ (which has multiple
-          # package-main files — pre-existing build problem) and benchmarks/
-          # (separate module).
+          # Lint library code only. The example/ demos are intentionally
+          # excluded (simplified error handling for readability); they are
+          # still built and vetted by the vet/test steps below.
           args: --timeout=5m . ./pkg/...
 
       - name: go test
-        run: go test -race -count=1 . ./pkg/...
+        run: go test -race -count=1 ./...

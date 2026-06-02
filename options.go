@@ -90,6 +90,16 @@ func WithErrorHandler(renderer ErrorRenderer) Option {
 	}
 }
 
+// WithBackplane sets the shared-state backplane used for cross-instance KV and
+// locks. When unset, an in-process Local backend is used, which is correct for
+// a single replica. Pass a clustered backend (see NewClusterBackplane) to share
+// state across pods/tasks without session affinity.
+func WithBackplane(bp Backplane) Option {
+	return func(app *App) {
+		app.backplane = bp
+	}
+}
+
 // WithRedirectTrailingSlash enables automatic redirects between /foo and
 // /foo/ when only one variant of a path is registered. The redirect uses
 // HTTP 308 (Permanent Redirect), which preserves the request method and

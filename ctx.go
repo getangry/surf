@@ -171,6 +171,10 @@ func (c *Context) NoContent(status int) error {
 	return nil
 }
 
+// Backplane returns the application's shared-state backplane (KV + locks). It
+// is never nil; absent configuration it is an in-process Local backend.
+func (c *Context) Backplane() Backplane { return c.app.backplane }
+
 // CtxService resolves a service registered with Provide[T] for use inside a
 // fast-path handler. It is the *Context counterpart to Service[T].
 func CtxService[T any](c *Context) (T, bool) {

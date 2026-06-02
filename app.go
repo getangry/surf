@@ -54,6 +54,10 @@ type App struct {
 	chain            http.Handler
 	chainOnce        sync.Once
 
+	// backplane shares coordination state (KV, locks) across instances.
+	// Defaults to an in-process Local backend; set WithBackplane to cluster.
+	backplane Backplane
+
 	// redirectTrailingSlash toggles automatic 308 redirects between /foo
 	// and /foo/ when only one variant is registered. Off by default.
 	redirectTrailingSlash bool
@@ -76,6 +80,19 @@ func NewApp(options ...Option) *App {
 
 	if app.ctx == nil {
 		app.ctx, app.cancel = context.WithCancel(context.Background())
+	}
+
+	// Default to an in-process backplane so single-instance deployments and
+	// tests need no configuration. A clustered backend (WithBackplane) runs
+	// background goroutines; bind them to the app context so they stop on
+	// shutdown.
+	if app.backplane == nil {
+		app.backplane = NewLocal()
+	}
+	if s, ok := app.backplane.(backplaneStarter); ok {
+		if err := s.start(app.ctx); err != nil {
+			app.logger.Error("backplane failed to start", "error", err)
+		}
 	}
 
 	if app.shutdown == nil {
@@ -173,10 +190,19 @@ func (app *App) GetService(key any) any {
 	return app.services[key]
 }
 
-// Cleanup stops signal notification and cancels context
+// Backplane returns the application's shared-state backplane. It is never nil:
+// when no WithBackplane option is given it is an in-process Local backend.
+func (app *App) Backplane() Backplane { return app.backplane }
+
+// Cleanup stops signal notification, closes the backplane, and cancels context.
 func (app *App) Cleanup() {
 	app.logger.Info("cleaning up application resources")
 	signal.Stop(app.shutdown)
+	if app.backplane != nil {
+		if err := app.backplane.Close(); err != nil {
+			app.logger.Error("backplane close failed", "error", err)
+		}
+	}
 	app.cancel()
 }
 
