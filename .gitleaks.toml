@@ -1,0 +1,16 @@
+# gitleaks configuration for surf.
+#
+# Extends gitleaks' default ruleset and allowlists one known false positive:
+# the RFC 6455 sample Sec-WebSocket-Key used in WebSocket handshake tests.
+# `dGhlIHNhbXBsZSBub25jZQ==` is base64 for the literal string "the sample
+# nonce" — the canonical example from RFC 6455 §1.3, a public protocol test
+# vector, not a credential.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "RFC 6455 sample Sec-WebSocket-Key (public test vector, not a secret)"
+regexes = [
+  '''dGhlIHNhbXBsZSBub25jZQ==''',
+]
