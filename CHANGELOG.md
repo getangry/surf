@@ -2,6 +2,53 @@
 
 All notable changes to Surf are documented in this file.
 
+## Unreleased
+
+### Logging (`pkg/logger/reef`)
+
+#### Performance
+
+- The colorized text path now pools its slog handler and output buffers
+  instead of reconstructing a handler and reparsing/reformatting on every
+  record. It is **allocation-free after warm-up** (down from ~20 allocations
+  per record), roughly 2.5× faster on the colorized path. The only remaining
+  allocation per record is slog's own — identical to a vanilla slog handler.
+
+#### Added
+
+- **`WithLevelWidth(n)`** (and `ColorConfig.LevelWidth`) sets the minimum width
+  the level column is padded to (default 5, which fits the standard levels).
+  Raise it for wider custom level names like `CRITICAL`.
+
+#### Changed
+
+- **`WithColors()` / `WithoutColors()` are now order-independent.** They toggle
+  the enable flag and fill in unset defaults without discarding custom key
+  colors, level colors, or other settings applied by other options. Previously
+  `WithColors()` replaced the entire color config, silently wiping options that
+  ran before it.
+- **JSON output no longer silently ignores colors.** ANSI codes cannot live in
+  JSON, so colorization is now explicitly skipped for `JSONHandler`; the
+  per-line color control attribute (`reef.Color`) is stripped from the
+  structured output rather than rendered.
+- **Colorized writes are serialized** with a per-writer mutex, matching the
+  concurrency guarantee the standard slog handlers provide. The lock is shared
+  across `WithAttrs`/`WithGroup` derivations of the same handler.
+
+#### Fixed
+
+- Custom levels and `slog.LevelVar` are now handled correctly. The handler no
+  longer reconstructs the level by probing the four standard levels, which
+  mishandled custom or dynamically-changing levels.
+- `WithGroup` no longer drops the `addSource` setting.
+
+#### Deprecated
+
+- **`WithForkedOutfile`** leaks the file descriptor it opens and cannot report
+  an open error. It no longer panics on a bad path (it logs a warning to stderr
+  and leaves the writer unchanged). Use **`WithForkedOutfileCloser`**, which
+  returns an `error` and an `io.Closer`.
+
 ## v0.2.1
 
 A small additive release picking up ideas from two superseded community PRs
