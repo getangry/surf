@@ -37,7 +37,14 @@ type ColorConfig struct {
 	LevelColors     map[slog.Level]string
 	ColorEntireLine bool
 	ColorAttrKey    string
+	// LevelWidth is the minimum width the level value is padded to so columns
+	// align. Zero means the default (defaultLevelWidth), which fits the four
+	// standard slog levels; raise it for longer custom level names.
+	LevelWidth int
 }
+
+// defaultLevelWidth fits DEBUG/INFO/WARN/ERROR.
+const defaultLevelWidth = 5
 
 // DefaultColorConfig provides default ANSI color codes for dimming
 var DefaultColorConfig = ColorConfig{
@@ -127,13 +134,18 @@ func (f *fileWriterCloser) Close() error {
 }
 
 // WithForkedOutfile writes logs to both the current writer and a file.
-// The returned file handle should be closed when the logger is no longer needed.
-// Consider using WithForkedOutfileCloser for explicit cleanup control.
+//
+// Deprecated: this option provides no way to close the file it opens (the
+// descriptor leaks for the process lifetime) and cannot report an open error
+// to the caller. Prefer WithForkedOutfileCloser, which returns both an error
+// and an io.Closer. If the file cannot be opened, this option logs a warning
+// to stderr and leaves the writer unchanged rather than crashing the program.
 func WithForkedOutfile(path string) Option {
 	return func(o *Options) {
 		f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 		if err != nil {
-			panic(fmt.Sprintf("failed to open log file %s: %v", path, err))
+			fmt.Fprintf(os.Stderr, "reef: failed to open log file %s: %v\n", path, err)
+			return
 		}
 		o.writer = io.MultiWriter(o.writer, f)
 	}
@@ -171,25 +183,34 @@ func WithColorConfig(config ColorConfig) Option {
 	}
 }
 
-// WithColors enables colors with default configuration
+// WithColors enables colors, filling in any unset escape codes with defaults.
+// Unlike assigning the whole config, it preserves KeyColors, LevelColors, and
+// other color settings applied by earlier or later options, so option order
+// does not matter.
 func WithColors() Option {
 	return func(o *Options) {
-		o.colorConfig = DefaultColorConfig
+		o.colorConfig.Enabled = true
+		if o.colorConfig.DimColor == "" {
+			o.colorConfig.DimColor = DefaultColorConfig.DimColor
+		}
+		if o.colorConfig.BrightenColor == "" {
+			o.colorConfig.BrightenColor = DefaultColorConfig.BrightenColor
+		}
+		if o.colorConfig.ResetColor == "" {
+			o.colorConfig.ResetColor = DefaultColorConfig.ResetColor
+		}
+		if o.colorConfig.ColorAttrKey == "" {
+			o.colorConfig.ColorAttrKey = DefaultColorConfig.ColorAttrKey
+		}
 	}
 }
 
-// WithoutColors disables color output
+// WithoutColors disables color output. It only flips the enable flag, leaving
+// any other color settings intact, so it is order-independent and the colors
+// can be re-enabled by a later WithColors.
 func WithoutColors() Option {
 	return func(o *Options) {
-		o.colorConfig = ColorConfig{
-			Enabled:         false,
-			DimColor:        "",
-			ResetColor:      "",
-			KeyColors:       make(map[string]string),
-			LevelColors:     make(map[slog.Level]string),
-			ColorEntireLine: false,
-			ColorAttrKey:    Color,
-		}
+		o.colorConfig.Enabled = false
 	}
 }
 
@@ -197,6 +218,14 @@ func WithoutColors() Option {
 func WithColorAttrKey(key string) Option {
 	return func(o *Options) {
 		o.colorConfig.ColorAttrKey = key
+	}
+}
+
+// WithLevelWidth sets the minimum width the level value is padded to. Use it
+// when custom level names are wider than the standard five characters.
+func WithLevelWidth(width int) Option {
+	return func(o *Options) {
+		o.colorConfig.LevelWidth = width
 	}
 }
 
@@ -295,6 +324,13 @@ func WithoutTimestamp() Option {
 	}
 }
 
+// renderLevel keeps the per-record render handler from re-filtering by level.
+// Enabled() (which delegates to the configured base handler) has already
+// decided whether a record should be emitted before Handle is called, so the
+// render handler must format unconditionally. A value far below any realistic
+// slog.Level guarantees it never suppresses a record.
+const renderLevel = slog.Level(-2147483648)
+
 // Handler wraps standard slog handlers with enhanced formatting options
 type Handler struct {
 	handler         slog.Handler
@@ -306,6 +342,12 @@ type Handler struct {
 	addSource       bool
 	attrs           []slog.Attr
 	groups          []string
+
+	// mu serializes writes to writer on the colorized path. slog's own
+	// handlers lock around their writer; reef writes colorized bytes itself,
+	// so it must provide the same guarantee. It is shared (same pointer) across
+	// handlers derived via WithAttrs/WithGroup since they share the writer.
+	mu *sync.Mutex
 
 	// Derived state, precomputed once per handler in finalize() so the
 	// per-record Handle path stays allocation-light.
@@ -331,7 +373,7 @@ type renderer struct {
 func (h *Handler) newRenderer() *renderer {
 	r := &renderer{}
 	opts := &slog.HandlerOptions{
-		Level:       h.getLevel(),
+		Level:       renderLevel,
 		AddSource:   h.addSource,
 		ReplaceAttr: h.getReplaceAttr(),
 	}
@@ -356,6 +398,11 @@ func (h *Handler) newRenderer() *renderer {
 // and before the handler is used, and the handler must be treated as immutable
 // afterwards.
 func (h *Handler) finalize() {
+	// Guarantees a write lock exists regardless of how the handler was built.
+	if h.mu == nil {
+		h.mu = &sync.Mutex{}
+	}
+
 	// Split persistent attrs into those forwarded to slog and the line color.
 	h.handlerLineColor = ""
 	h.handlerAttrs = nil
@@ -457,6 +504,7 @@ func NewHandler(opts ...Option) *Handler {
 		addSource:       options.addSource,
 		attrs:           make([]slog.Attr, 0),
 		groups:          make([]string, 0),
+		mu:              &sync.Mutex{},
 	}
 	h.finalize()
 	return h
@@ -523,6 +571,16 @@ func (h *Handler) parseColorValue(colorValue string) string {
 
 // Handle processes log records and applies colorization to field values
 func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
+	// ANSI colors cannot be embedded in JSON without corrupting the structure,
+	// so colorization is intentionally skipped for JSON output. The base
+	// handler is used directly (it locks around its own writer); the per-line
+	// color control attribute is still stripped so it never leaks into the
+	// structured output.
+	if h.hType == JSONHandler {
+		h.extractRecordColor(&record)
+		return h.handler.Handle(ctx, record)
+	}
+
 	if !h.config.Enabled {
 		// Uses base handler without modification when colors are disabled
 		return h.handler.Handle(ctx, record)
@@ -543,32 +601,15 @@ func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
 		return err
 	}
 
-	// Colorizes the raw slog output into the renderer's output buffer and
-	// writes it in a single call.
+	// Colorizes the raw slog output into the renderer's output buffer, then
+	// writes it in a single call. The write is serialized so concurrent
+	// goroutines cannot interleave bytes on a non-locking writer.
 	h.colorizeInto(&r.out, r.buf.Bytes(), record.Level, lineColor)
+	h.mu.Lock()
 	_, writeErr := h.writer.Write(r.out.Bytes())
+	h.mu.Unlock()
 	h.rpool.Put(r)
 	return writeErr
-}
-
-// getLevel extracts the level from the wrapped handler options
-func (h *Handler) getLevel() slog.Level {
-	// Attempts to get level from the handler, defaults to Info
-	if leveler, ok := h.handler.(interface {
-		Enabled(context.Context, slog.Level) bool
-	}); ok {
-		for _, level := range []slog.Level{slog.LevelDebug, slog.LevelInfo, slog.LevelWarn, slog.LevelError} {
-			if leveler.Enabled(context.Background(), level) {
-				return level
-			}
-		}
-	}
-	return slog.LevelInfo
-}
-
-// getAddSource determines if source information should be included
-func (h *Handler) getAddSource() bool {
-	return h.addSource
 }
 
 // getReplaceAttr gets the replace attribute function for timestamp handling
@@ -729,11 +770,16 @@ func (h *Handler) colorizeLineFieldsInto(out *bytes.Buffer, line []byte, level s
 		valueEnd := findValueEnd(line, valueStart)
 		value := line[valueStart:valueEnd]
 
-		// Applies value coloring, padding the level value to a fixed width.
+		// Applies value coloring, padding the level value to a minimum width
+		// so columns align (configurable for custom level names).
 		out.WriteString(valueColor)
 		out.Write(value)
 		if string(key) == slog.LevelKey {
-			for k := len(value); k < 5; k++ {
+			width := h.config.LevelWidth
+			if width == 0 {
+				width = defaultLevelWidth
+			}
+			for k := len(value); k < width; k++ {
 				out.WriteByte(' ')
 			}
 		}
@@ -806,6 +852,7 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 		addSource:       h.addSource,
 		attrs:           newAttrs, // Keeps all attributes including color for extraction
 		groups:          newGroups,
+		mu:              h.mu, // shares the writer, so shares the write lock
 	}
 	// finalize derives handlerAttrs (attrs without the color attribute), which
 	// is exactly what the underlying handler needs.
@@ -834,6 +881,7 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 		addSource:       h.addSource,
 		attrs:           newAttrs, // Keeps all attributes including color for extraction
 		groups:          newGroups,
+		mu:              h.mu, // shares the writer, so shares the write lock
 	}
 	nh.finalize()
 	nh.handler = h.handler.WithGroup(name).WithAttrs(nh.handlerAttrs)
