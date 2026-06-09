@@ -4,6 +4,7 @@
 package reef
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -304,6 +306,91 @@ type Handler struct {
 	addSource       bool
 	attrs           []slog.Attr
 	groups          []string
+
+	// Derived state, precomputed once per handler in finalize() so the
+	// per-record Handle path stays allocation-light.
+	handlerAttrs     []slog.Attr          // attrs minus the color attribute
+	handlerLineColor string               // line color carried by handler attrs
+	keyColorPairs    map[string][2]string // per-key {keyColor, valueColor}
+	rpool            *sync.Pool           // pool of *renderer
+}
+
+// renderer holds a reusable slog handler bound to a private buffer, plus a
+// second buffer for the colorized output. Renderers are pooled so the
+// expensive slog handler construction and buffer growth happen once and are
+// amortized across log records. A renderer is owned exclusively by a single
+// Handle call while checked out of the pool, so it needs no locking.
+type renderer struct {
+	handler slog.Handler
+	buf     bytes.Buffer // raw slog output
+	out     bytes.Buffer // colorized output
+}
+
+// newRenderer builds a renderer whose slog handler already has this handler's
+// groups and attributes applied, bound to the renderer's private buffer.
+func (h *Handler) newRenderer() *renderer {
+	r := &renderer{}
+	opts := &slog.HandlerOptions{
+		Level:       h.getLevel(),
+		AddSource:   h.addSource,
+		ReplaceAttr: h.getReplaceAttr(),
+	}
+	var th slog.Handler
+	if h.hType == JSONHandler {
+		th = slog.NewJSONHandler(&r.buf, opts)
+	} else {
+		th = slog.NewTextHandler(&r.buf, opts)
+	}
+	for _, group := range h.groups {
+		th = th.WithGroup(group)
+	}
+	if len(h.handlerAttrs) > 0 {
+		th = th.WithAttrs(h.handlerAttrs)
+	}
+	r.handler = th
+	return r
+}
+
+// finalize precomputes the derived state that Handle relies on. It must be
+// called after the core fields (handler, config, attrs, groups, ...) are set
+// and before the handler is used, and the handler must be treated as immutable
+// afterwards.
+func (h *Handler) finalize() {
+	// Split persistent attrs into those forwarded to slog and the line color.
+	h.handlerLineColor = ""
+	h.handlerAttrs = nil
+	if len(h.attrs) > 0 {
+		h.handlerAttrs = make([]slog.Attr, 0, len(h.attrs))
+		for _, attr := range h.attrs {
+			if h.config.ColorAttrKey != "" && attr.Key == h.config.ColorAttrKey {
+				h.handlerLineColor = h.parseColorValue(unquote(attr.Value.String()))
+			} else {
+				h.handlerAttrs = append(h.handlerAttrs, attr)
+			}
+		}
+	}
+
+	// Custom key colors are independent of level and per-line color, so the
+	// concatenated escape sequences can be built once here.
+	if len(h.config.KeyColors) > 0 {
+		h.keyColorPairs = make(map[string][2]string, len(h.config.KeyColors))
+		for key, color := range h.config.KeyColors {
+			h.keyColorPairs[key] = [2]string{
+				color + h.config.DimColor,   // dimmed custom color for the key
+				h.config.ResetColor + color, // full custom color for the value
+			}
+		}
+	}
+
+	h.rpool = &sync.Pool{New: func() any { return h.newRenderer() }}
+}
+
+// unquote strips a single pair of surrounding double quotes if present.
+func unquote(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
 }
 
 // NewHandler creates a new custom handler with the specified options
@@ -360,7 +447,7 @@ func NewHandler(opts ...Option) *Handler {
 		baseHandler = slog.NewTextHandler(options.writer, baseOptions)
 	}
 
-	return &Handler{
+	h := &Handler{
 		handler:         baseHandler,
 		config:          options.colorConfig,
 		writer:          options.writer,
@@ -371,56 +458,51 @@ func NewHandler(opts ...Option) *Handler {
 		attrs:           make([]slog.Attr, 0),
 		groups:          make([]string, 0),
 	}
+	h.finalize()
+	return h
 }
 
-// extractLineColor extracts and removes color attribute from log record and handler attributes
-func (h *Handler) extractLineColor(record *slog.Record) (string, []slog.Attr) {
+// extractRecordColor resolves the effective per-line color for a record and,
+// only when the record actually carries a color attribute, rebuilds the record
+// without it so the attribute is not rendered. The handler's persistent color
+// (from .With()) is precomputed in finalize, so the common path scans the
+// record once and never reallocates it.
+func (h *Handler) extractRecordColor(record *slog.Record) string {
+	lineColor := h.handlerLineColor
 	if h.config.ColorAttrKey == "" {
-		return "", h.attrs
+		return lineColor
 	}
 
-	var lineColor string
-	var newRecordAttrs []slog.Attr
-	var newHandlerAttrs []slog.Attr
-
-	// Checks handler's persistent attributes first (from .With() calls)
-	for _, attr := range h.attrs {
-		if attr.Key == h.config.ColorAttrKey {
-			colorValue := attr.Value.String()
-			// Removes quotes if present
-			if len(colorValue) >= 2 && colorValue[0] == '"' && colorValue[len(colorValue)-1] == '"' {
-				colorValue = colorValue[1 : len(colorValue)-1]
-			}
-			lineColor = h.parseColorValue(colorValue)
-		} else {
-			newHandlerAttrs = append(newHandlerAttrs, attr)
-		}
-	}
-
-	// Checks record's immediate attributes (from log call itself)
+	// Cheap detection pass: most records have no color attribute, in which
+	// case the record is left untouched.
+	hasColor := false
 	record.Attrs(func(attr slog.Attr) bool {
 		if attr.Key == h.config.ColorAttrKey {
-			colorValue := attr.Value.String()
-			// Removes quotes if present
-			if len(colorValue) >= 2 && colorValue[0] == '"' && colorValue[len(colorValue)-1] == '"' {
-				colorValue = colorValue[1 : len(colorValue)-1]
-			}
-			// Record attributes take precedence over handler attributes
-			lineColor = h.parseColorValue(colorValue)
-		} else {
-			newRecordAttrs = append(newRecordAttrs, attr)
+			hasColor = true
+			return false
 		}
 		return true
 	})
-
-	// Creates new record without the color attribute if it was found in record
-	if len(newRecordAttrs) != 0 || lineColor != "" {
-		newRecord := slog.NewRecord(record.Time, record.Level, record.Message, record.PC)
-		newRecord.AddAttrs(newRecordAttrs...)
-		*record = newRecord
+	if !hasColor {
+		return lineColor
 	}
 
-	return lineColor, newHandlerAttrs
+	// Rebuild the record without the color attribute. Record attributes take
+	// precedence over the handler-level color.
+	kept := make([]slog.Attr, 0, record.NumAttrs())
+	record.Attrs(func(attr slog.Attr) bool {
+		if attr.Key == h.config.ColorAttrKey {
+			lineColor = h.parseColorValue(unquote(attr.Value.String()))
+		} else {
+			kept = append(kept, attr)
+		}
+		return true
+	})
+	newRecord := slog.NewRecord(record.Time, record.Level, record.Message, record.PC)
+	newRecord.AddAttrs(kept...)
+	*record = newRecord
+
+	return lineColor
 }
 
 // parseColorValue converts color name or ANSI code to ANSI escape sequence
@@ -441,52 +523,31 @@ func (h *Handler) parseColorValue(colorValue string) string {
 
 // Handle processes log records and applies colorization to field values
 func (h *Handler) Handle(ctx context.Context, record slog.Record) error {
-	var tempHandler slog.Handler
-
-	// if !h.config.Enabled || h.hType == JSONHandler {
 	if !h.config.Enabled {
-		// Uses base handler without modification for JSON or when colors disabled
+		// Uses base handler without modification when colors are disabled
 		return h.handler.Handle(ctx, record)
 	}
 
-	// Extracts per-line color attribute if present and gets filtered handler attributes
-	lineColor, filteredHandlerAttrs := h.extractLineColor(&record)
+	// Resolves the per-line color, stripping the color attribute from the
+	// record only when one is actually present.
+	lineColor := h.extractRecordColor(&record)
 
-	// Creates a custom buffer to capture and modify the output
-	var buf strings.Builder
-	if h.hType == JSONHandler {
-		tempHandler = slog.NewJSONHandler(&buf, &slog.HandlerOptions{
-			Level:       h.getLevel(),
-			AddSource:   h.getAddSource(),
-			ReplaceAttr: h.getReplaceAttr(),
-		})
-	} else {
-		tempHandler = slog.NewTextHandler(&buf, &slog.HandlerOptions{
-			Level:       h.getLevel(),
-			AddSource:   h.getAddSource(),
-			ReplaceAttr: h.getReplaceAttr(),
-		})
-	}
+	// Checks out a pooled renderer whose slog handler already carries this
+	// handler's groups and attributes, so nothing is reconstructed per record.
+	r := h.rpool.Get().(*renderer)
+	r.buf.Reset()
+	r.out.Reset()
 
-	// Applies groups to temp handler. WithGroup already returns slog.Handler;
-	// the type assertion was redundant.
-	for _, group := range h.groups {
-		tempHandler = tempHandler.WithGroup(group)
-	}
-
-	// Applies filtered attributes to temp handler (without color attribute).
-	if len(filteredHandlerAttrs) > 0 {
-		tempHandler = tempHandler.WithAttrs(filteredHandlerAttrs)
-	}
-
-	err := tempHandler.Handle(ctx, record)
-	if err != nil {
+	if err := r.handler.Handle(ctx, record); err != nil {
+		h.rpool.Put(r)
 		return err
 	}
 
-	// Applies color formatting to the captured output
-	colorized := h.colorizeFieldValues(buf.String(), record.Level, lineColor)
-	_, writeErr := h.writer.Write([]byte(colorized))
+	// Colorizes the raw slog output into the renderer's output buffer and
+	// writes it in a single call.
+	h.colorizeInto(&r.out, r.buf.Bytes(), record.Level, lineColor)
+	_, writeErr := h.writer.Write(r.out.Bytes())
+	h.rpool.Put(r)
 	return writeErr
 }
 
@@ -531,41 +592,49 @@ func (h *Handler) getReplaceAttr() func(groups []string, a slog.Attr) slog.Attr 
 	}
 }
 
-// colorizeFieldValues applies dim coloring to field values in text output
+// colorizeFieldValues applies dim coloring to field values in text output.
+// It is a string-based convenience wrapper around colorizeInto.
 func (h *Handler) colorizeFieldValues(text string, level slog.Level, lineColor string) string {
 	if !h.config.Enabled {
 		return text
 	}
+	var out bytes.Buffer
+	h.colorizeInto(&out, []byte(text), level, lineColor)
+	return out.String()
+}
 
-	lines := strings.Split(text, "\n")
-	var result strings.Builder
-
-	for _, line := range lines {
-		if line == "" {
-			continue // Skips empty lines
+// colorizeInto colorizes raw slog output and appends the result to out. It
+// iterates lines in place without splitting into a slice and writes directly
+// into the output buffer to avoid per-line allocations.
+func (h *Handler) colorizeInto(out *bytes.Buffer, text []byte, level slog.Level, lineColor string) {
+	n := len(text)
+	for i := 0; i < n; {
+		// Finds the end of the current line.
+		j := i
+		for j < n && text[j] != '\n' {
+			j++
 		}
+		line := text[i:j]
 
-		var processedLine string
-		if strings.Contains(line, "=") {
-			processedLine = h.colorizeLineFields(line, level, lineColor)
-		} else {
-			processedLine = line
-			// Applies line coloring to non-field lines if enabled
-			effectiveColor := h.getEffectiveLineColor(level, lineColor)
-			if effectiveColor != "" {
-				processedLine = effectiveColor + processedLine + h.config.ResetColor
+		if len(line) > 0 {
+			if bytes.IndexByte(line, '=') >= 0 {
+				h.colorizeLineFieldsInto(out, line, level, lineColor)
+			} else if effectiveColor := h.getEffectiveLineColor(level, lineColor); effectiveColor != "" {
+				out.WriteString(effectiveColor)
+				out.Write(line)
+				out.WriteString(h.config.ResetColor)
+			} else {
+				out.Write(line)
+			}
+
+			// Preserves the line terminator when this segment had one.
+			if j < n {
+				out.WriteByte('\n')
 			}
 		}
 
-		result.WriteString(processedLine)
-
-		// Preserves original line endings
-		if line != lines[len(lines)-1] {
-			result.WriteString("\n")
-		}
+		i = j + 1
 	}
-
-	return result.String()
 }
 
 // getEffectiveLineColor determines the color to use for the line based on priority
@@ -585,11 +654,10 @@ func (h *Handler) getEffectiveLineColor(level slog.Level, lineColor string) stri
 	return ""
 }
 
-// colorizeLineFields processes a single line and colors field values with level-aware coloring
-func (h *Handler) colorizeLineFields(line string, level slog.Level, lineColor string) string {
-	var result strings.Builder
-	i := 0
-
+// colorizeLineFieldsInto processes a single line and writes its colorized form
+// into out, applying level-aware coloring. It operates on a byte slice and
+// uses precomputed per-key colors to avoid per-field allocations.
+func (h *Handler) colorizeLineFieldsInto(out *bytes.Buffer, line []byte, level slog.Level, lineColor string) {
 	// Determines effective line color (per-line attribute overrides level color)
 	effectiveLineColor := h.getEffectiveLineColor(level, lineColor)
 
@@ -603,16 +671,20 @@ func (h *Handler) colorizeLineFields(line string, level slog.Level, lineColor st
 		baseValueColor = h.config.BrightenColor
 	}
 
+	i := 0
 	for i < len(line) {
 		// Finds the next key=value pattern
-		eqIndex := strings.Index(line[i:], "=")
+		eqIndex := bytes.IndexByte(line[i:], '=')
 		if eqIndex == -1 {
 			// No more key=value pairs, append the rest with line coloring if enabled
 			remaining := line[i:]
 			if effectiveLineColor != "" {
-				remaining = effectiveLineColor + remaining + h.config.ResetColor
+				out.WriteString(effectiveLineColor)
+				out.Write(remaining)
+				out.WriteString(h.config.ResetColor)
+			} else {
+				out.Write(remaining)
 			}
-			result.WriteString(remaining)
 			break
 		}
 
@@ -627,52 +699,53 @@ func (h *Handler) colorizeLineFields(line string, level slog.Level, lineColor st
 
 		// Writes everything before this key=value pair with line coloring if enabled
 		prefix := line[i:keyStart]
-		if prefix != "" && effectiveLineColor != "" {
-			prefix = effectiveLineColor + prefix + h.config.ResetColor
+		if len(prefix) > 0 {
+			if effectiveLineColor != "" {
+				out.WriteString(effectiveLineColor)
+				out.Write(prefix)
+				out.WriteString(h.config.ResetColor)
+			} else {
+				out.Write(prefix)
+			}
 		}
-		result.WriteString(prefix)
 
 		// Extracts the key
 		key := line[keyStart:eqIndex]
 
-		// Determines color to use for this key (custom colors override line/level colors)
-		var keyColor, valueColor string
-		if customColor, exists := h.config.KeyColors[key]; exists {
-			keyColor = customColor + h.config.DimColor     // Dimmed version of custom color
-			valueColor = h.config.ResetColor + customColor // Full custom color for value
-		} else {
-			keyColor = baseKeyColor
-			valueColor = baseValueColor
+		// Determines color to use for this key (custom colors override line/level colors).
+		// The string(key) map lookups are special-cased by the compiler and do not allocate.
+		keyColor, valueColor := baseKeyColor, baseValueColor
+		if pair, exists := h.keyColorPairs[string(key)]; exists {
+			keyColor, valueColor = pair[0], pair[1]
 		}
 
 		// Applies key coloring
-		result.WriteString(keyColor)
-		result.WriteString(key)
-		result.WriteString("=")
+		out.WriteString(keyColor)
+		out.Write(key)
+		out.WriteByte('=')
 
 		// Finds the value after the =
 		valueStart := eqIndex + 1
-		valueEnd := h.findValueEnd(line, valueStart)
-
-		// Extracts and colors the value
+		valueEnd := findValueEnd(line, valueStart)
 		value := line[valueStart:valueEnd]
-		if key == slog.LevelKey {
-			value = fmt.Sprintf("%-5s", value)
-		}
 
-		result.WriteString(valueColor)
-		result.WriteString(value)
-		result.WriteString(h.config.ResetColor)
+		// Applies value coloring, padding the level value to a fixed width.
+		out.WriteString(valueColor)
+		out.Write(value)
+		if string(key) == slog.LevelKey {
+			for k := len(value); k < 5; k++ {
+				out.WriteByte(' ')
+			}
+		}
+		out.WriteString(h.config.ResetColor)
 
 		// Moves to the next position
 		i = valueEnd
 	}
-
-	return result.String()
 }
 
 // findValueEnd determines where a field value ends, handling quoted strings
-func (h *Handler) findValueEnd(line string, start int) int {
+func findValueEnd(line []byte, start int) int {
 	if start >= len(line) {
 		return start
 	}
@@ -724,16 +797,7 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 	newGroups := make([]string, len(h.groups))
 	copy(newGroups, h.groups)
 
-	// Creates handler attributes without color attribute for the underlying handler
-	var handlerAttrs []slog.Attr
-	for _, attr := range newAttrs {
-		if attr.Key != h.config.ColorAttrKey {
-			handlerAttrs = append(handlerAttrs, attr)
-		}
-	}
-
-	return &Handler{
-		handler:         h.handler.WithAttrs(handlerAttrs),
+	nh := &Handler{
 		config:          h.config,
 		writer:          h.writer,
 		hType:           h.hType,
@@ -743,6 +807,11 @@ func (h *Handler) WithAttrs(attrs []slog.Attr) slog.Handler {
 		attrs:           newAttrs, // Keeps all attributes including color for extraction
 		groups:          newGroups,
 	}
+	// finalize derives handlerAttrs (attrs without the color attribute), which
+	// is exactly what the underlying handler needs.
+	nh.finalize()
+	nh.handler = h.handler.WithAttrs(nh.handlerAttrs)
+	return nh
 }
 
 // WithGroup returns a new handler with the given group name
@@ -756,24 +825,19 @@ func (h *Handler) WithGroup(name string) slog.Handler {
 	newAttrs := make([]slog.Attr, len(h.attrs))
 	copy(newAttrs, h.attrs)
 
-	// Creates handler attributes without color attribute for the underlying handler
-	var handlerAttrs []slog.Attr
-	for _, attr := range h.attrs {
-		if attr.Key != h.config.ColorAttrKey {
-			handlerAttrs = append(handlerAttrs, attr)
-		}
-	}
-
-	return &Handler{
-		handler:         h.handler.WithGroup(name).WithAttrs(handlerAttrs),
+	nh := &Handler{
 		config:          h.config,
 		writer:          h.writer,
 		hType:           h.hType,
 		timestampFormat: h.timestampFormat,
 		removeTimestamp: h.removeTimestamp,
+		addSource:       h.addSource,
 		attrs:           newAttrs, // Keeps all attributes including color for extraction
 		groups:          newGroups,
 	}
+	nh.finalize()
+	nh.handler = h.handler.WithGroup(name).WithAttrs(nh.handlerAttrs)
+	return nh
 }
 
 func Backtrace(offset ...int) slog.Attr {

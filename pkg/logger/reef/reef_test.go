@@ -285,8 +285,6 @@ func TestParseColorValue(t *testing.T) {
 }
 
 func TestFindValueEnd(t *testing.T) {
-	handler := NewHandler()
-
 	tests := []struct {
 		name     string
 		line     string
@@ -302,7 +300,7 @@ func TestFindValueEnd(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := handler.findValueEnd(tt.line, tt.start)
+			result := findValueEnd([]byte(tt.line), tt.start)
 			if result != tt.expected {
 				t.Errorf("Expected %d, got %d for line %q starting at %d", tt.expected, result, tt.line, tt.start)
 			}
@@ -461,25 +459,27 @@ func BenchmarkReefHandle(b *testing.B) {
 	)
 
 	logger := slog.New(handler)
-	b.ResetTimer()
-	for range b.N {
+	ts := time.Now()
+	b.ReportAllocs()
+	for b.Loop() {
 		buf.Reset()
 		logger.Info("benchmark message",
 			"user", "john",
 			"database", "postgres",
 			"version", "1.0.0",
-			"timestamp", time.Now())
+			"timestamp", ts)
 	}
+}
 
-	vanillaLogger := slog.New(slog.NewTextHandler(buf, nil))
-	b.ResetTimer()
+func BenchmarkReefHandleWithAttrs(b *testing.B) {
+	buf := &bytes.Buffer{}
+	handler := NewHandler(WithWriter(buf), WithColors())
+	logger := slog.New(handler).With("service", "api", "env", "prod")
+	ts := time.Now()
+	b.ReportAllocs()
 	for b.Loop() {
 		buf.Reset()
-		vanillaLogger.Info("benchmark message",
-			"user", "john",
-			"database", "postgres",
-			"version", "1.0.0",
-			"timestamp", time.Now())
+		logger.Info("benchmark message", "user", "john", "timestamp", ts)
 	}
 }
 
@@ -487,13 +487,14 @@ func BenchmarkSlogHandle(b *testing.B) {
 	buf := &bytes.Buffer{}
 
 	vanillaLogger := slog.New(slog.NewTextHandler(buf, nil))
-	b.ResetTimer()
+	ts := time.Now()
+	b.ReportAllocs()
 	for b.Loop() {
 		buf.Reset()
 		vanillaLogger.Info("benchmark message",
 			"user", "john",
 			"database", "postgres",
 			"version", "1.0.0",
-			"timestamp", time.Now())
+			"timestamp", ts)
 	}
 }
