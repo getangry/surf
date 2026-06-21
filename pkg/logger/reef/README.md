@@ -4,11 +4,12 @@ Reef is a powerful, customizable slog handler for Go that enhances log output wi
 
 ## Features
 
-- **ANSI Color Support**: Colorize log levels, field keys, and values
+- **ANSI Color Support**: Colorize log levels, field keys, and values (text output)
 - **Multiple Output Formats**: Text and JSON handlers
 - **Field-Specific Coloring**: Assign custom colors to specific field keys
-- **Flexible Configuration**: Extensive customization options
-- **Performance Optimized**: Minimal overhead compared to standard slog
+- **Flexible Configuration**: Extensive, order-independent options
+- **Performance Optimized**: Allocation-free on the colorized hot path (see [Performance](#performance))
+- **Concurrency-Safe**: Writes are serialized, like the standard slog handlers
 - **Timestamp Control**: Custom formats or remove timestamps entirely
 - **Source Code Location**: Optional file/line number tracking
 - **Dynamic Line Coloring**: Color entire log lines based on attributes
@@ -57,6 +58,11 @@ logger := slog.New(handler)
 logger.Info("JSON formatted log", "user", "john", "action", "login")
 ```
 
+> **Note:** Colorization applies to text output only. With `JSONHandler`, color
+> options (`WithColors`, `WithKeyColors`, level colors, …) are ignored so the
+> emitted JSON stays valid — ANSI escape codes are never injected. The per-line
+> color attribute (`reef.Color`) is stripped from JSON output rather than logged.
+
 ## Configuration Options
 
 ### Output Format
@@ -87,6 +93,16 @@ handler := reef.NewHandler(
 handler := reef.NewHandler(
     reef.WithoutColors(),
 )
+```
+
+`WithColors()` and `WithoutColors()` only toggle the enable flag and fill in any
+unset defaults; they preserve other color settings (custom key colors, level
+colors, etc.) regardless of option order. So both of these produce the same
+result:
+
+```go
+reef.NewHandler(reef.WithKeyColors(m), reef.WithColors())
+reef.NewHandler(reef.WithColors(), reef.WithKeyColors(m))
 ```
 
 #### Custom Field Colors
@@ -196,6 +212,17 @@ handler := reef.NewHandler(
 )
 ```
 
+The level value is padded to a minimum width so columns line up (default 5,
+which fits `DEBUG`/`INFO`/`WARN`/`ERROR`). Raise it for wider custom level names:
+
+```go
+// Pad the level to 8 columns for names like "CRITICAL" or "NOTICE"
+handler := reef.NewHandler(
+    reef.WithColors(),
+    reef.WithLevelWidth(8),
+)
+```
+
 ### Source Code Location
 
 ```go
@@ -218,12 +245,24 @@ handler := reef.NewHandler(
     reef.WithWriter(&buf),
 )
 
-// Fork output to both stdout and a file
+// Fork output to both stdout and a file, with explicit cleanup (preferred)
+forkOpt, closer, err := reef.WithForkedOutfileCloser("/var/log/app.log")
+if err != nil {
+    log.Fatal(err)
+}
+defer closer.Close()
+
 handler := reef.NewHandler(
     reef.WithWriter(os.Stdout),
-    reef.WithForkedOutfile("/var/log/app.log"),
+    forkOpt,
 )
 ```
+
+> **Deprecated:** `WithForkedOutfile("/var/log/app.log")` still exists but
+> provides no way to close the file it opens (the descriptor leaks for the
+> process lifetime) and cannot report an open error. If the file can't be
+> opened it now logs a warning to stderr and leaves the writer unchanged
+> instead of panicking. Prefer `WithForkedOutfileCloser`, shown above.
 
 ## Advanced Examples
 
@@ -231,11 +270,17 @@ handler := reef.NewHandler(
 
 ```go
 // Production setup with JSON output and file logging
+forkOpt, closer, err := reef.WithForkedOutfileCloser("/var/log/myapp.log")
+if err != nil {
+    log.Fatal(err)
+}
+defer closer.Close()
+
 handler := reef.NewHandler(
     reef.WithHandlerType(reef.JSONHandler),
     reef.WithLevel(slog.LevelInfo),
     reef.WithTimestampFormat(time.RFC3339),
-    reef.WithForkedOutfile("/var/log/myapp.log"),
+    forkOpt,
 )
 
 logger := slog.New(handler)
@@ -352,13 +397,21 @@ You can also use raw ANSI escape codes:
 
 ## Performance
 
-Reef is designed to have minimal overhead compared to standard slog handlers. The colorization is applied efficiently during output formatting, and when colors are disabled or JSON format is used, the performance is nearly identical to vanilla slog.
+Reef is designed for minimal overhead. The colorized text path pools its
+handler and buffers, so after warm-up it adds **zero heap allocations** over
+vanilla slog — the only allocation per record is slog's own. When colors are
+disabled, or JSON format is used, records go straight to the underlying slog
+handler and performance is effectively identical to vanilla slog.
 
-```go
-// Benchmark comparison (from reef_test.go)
-// BenchmarkReefHandle-8       500000      2847 ns/op
-// BenchmarkSlogHandle-8       500000      2654 ns/op
+```text
+# Apple M4, `go test -bench . -benchmem ./pkg/logger/reef/`
+BenchmarkReefHandle-10     ~1400 ns/op    24 B/op    1 allocs/op   # colorized text
+BenchmarkSlogHandle-10      ~900 ns/op    24 B/op    1 allocs/op   # vanilla slog
 ```
+
+Colorized text output costs roughly 1.5× vanilla slog in CPU (the colorization
+scan) while matching it on allocations. Numbers are illustrative and vary by
+machine; run the benchmarks yourself for your hardware.
 
 ## Best Practices
 
