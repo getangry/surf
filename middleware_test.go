@@ -23,6 +23,10 @@ func TestCORSMiddleware(t *testing.T) {
 	t.Run("preflight request", func(t *testing.T) {
 		req := httptest.NewRequest("OPTIONS", "/test", nil)
 		req.Header.Set("Origin", "http://example.com")
+		// A genuine CORS preflight carries Access-Control-Request-Method; this
+		// is what CORS short-circuits (a plain OPTIONS falls through to the
+		// router's automatic OPTIONS handler instead).
+		req.Header.Set("Access-Control-Request-Method", "POST")
 		rec := httptest.NewRecorder()
 
 		app.ServeHTTP(rec, req)
@@ -35,6 +39,10 @@ func TestCORSMiddleware(t *testing.T) {
 		}
 		if rec.Header().Get("Access-Control-Allow-Methods") == "" {
 			t.Error("Access-Control-Allow-Methods not set")
+		}
+		// The default method set advertises QUERY (RFC 10008).
+		if m := rec.Header().Get("Access-Control-Allow-Methods"); !strings.Contains(m, "QUERY") {
+			t.Errorf("Access-Control-Allow-Methods = %q, want it to include QUERY", m)
 		}
 	})
 
