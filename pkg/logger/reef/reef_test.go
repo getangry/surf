@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -285,8 +288,6 @@ func TestParseColorValue(t *testing.T) {
 }
 
 func TestFindValueEnd(t *testing.T) {
-	handler := NewHandler()
-
 	tests := []struct {
 		name     string
 		line     string
@@ -302,7 +303,7 @@ func TestFindValueEnd(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := handler.findValueEnd(tt.line, tt.start)
+			result := findValueEnd([]byte(tt.line), tt.start)
 			if result != tt.expected {
 				t.Errorf("Expected %d, got %d for line %q starting at %d", tt.expected, result, tt.line, tt.start)
 			}
@@ -461,25 +462,27 @@ func BenchmarkReefHandle(b *testing.B) {
 	)
 
 	logger := slog.New(handler)
-	b.ResetTimer()
-	for range b.N {
+	ts := time.Now()
+	b.ReportAllocs()
+	for b.Loop() {
 		buf.Reset()
 		logger.Info("benchmark message",
 			"user", "john",
 			"database", "postgres",
 			"version", "1.0.0",
-			"timestamp", time.Now())
+			"timestamp", ts)
 	}
+}
 
-	vanillaLogger := slog.New(slog.NewTextHandler(buf, nil))
-	b.ResetTimer()
+func BenchmarkReefHandleWithAttrs(b *testing.B) {
+	buf := &bytes.Buffer{}
+	handler := NewHandler(WithWriter(buf), WithColors())
+	logger := slog.New(handler).With("service", "api", "env", "prod")
+	ts := time.Now()
+	b.ReportAllocs()
 	for b.Loop() {
 		buf.Reset()
-		vanillaLogger.Info("benchmark message",
-			"user", "john",
-			"database", "postgres",
-			"version", "1.0.0",
-			"timestamp", time.Now())
+		logger.Info("benchmark message", "user", "john", "timestamp", ts)
 	}
 }
 
@@ -487,13 +490,132 @@ func BenchmarkSlogHandle(b *testing.B) {
 	buf := &bytes.Buffer{}
 
 	vanillaLogger := slog.New(slog.NewTextHandler(buf, nil))
-	b.ResetTimer()
+	ts := time.Now()
+	b.ReportAllocs()
 	for b.Loop() {
 		buf.Reset()
 		vanillaLogger.Info("benchmark message",
 			"user", "john",
 			"database", "postgres",
 			"version", "1.0.0",
-			"timestamp", time.Now())
+			"timestamp", ts)
+	}
+}
+
+// TestColorOptionOrderIndependence verifies that WithColors no longer clobbers
+// color settings applied by other options regardless of option order.
+func TestColorOptionOrderIndependence(t *testing.T) {
+	const magenta = "\033[95m"
+	keyColors := map[string]string{"user": magenta}
+
+	orders := []struct {
+		name string
+		opts []Option
+	}{
+		{"keyColors before WithColors", []Option{WithKeyColors(keyColors), WithColors()}},
+		{"WithColors before keyColors", []Option{WithColors(), WithKeyColors(keyColors)}},
+	}
+
+	for _, o := range orders {
+		t.Run(o.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			opts := append([]Option{WithWriter(&buf), WithoutTimestamp()}, o.opts...)
+			logger := slog.New(NewHandler(opts...))
+			logger.Info("msg", "user", "john")
+			if !strings.Contains(buf.String(), magenta) {
+				t.Errorf("custom key color %q was dropped; got %q", magenta, buf.String())
+			}
+		})
+	}
+}
+
+// TestJSONHandlerIgnoresColors verifies that JSON output carries no ANSI codes
+// even with colors enabled, and that the per-line color control attribute is
+// stripped from the structured output.
+func TestJSONHandlerIgnoresColors(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(NewHandler(
+		WithWriter(&buf),
+		WithHandlerType(JSONHandler),
+		WithColors(),
+		WithKeyColors(map[string]string{"user": "\033[95m"}),
+		WithoutTimestamp(),
+	))
+	logger.Info("msg", "user", "john", Color, "red")
+
+	out := buf.String()
+	if strings.Contains(out, "\033[") {
+		t.Errorf("JSON output should contain no ANSI escape codes; got %q", out)
+	}
+	if strings.Contains(out, Color) {
+		t.Errorf("color control attribute %q leaked into JSON output: %q", Color, out)
+	}
+	if !strings.Contains(out, `"user":"john"`) {
+		t.Errorf("expected JSON to contain the user field; got %q", out)
+	}
+}
+
+// TestConcurrentHandleNoInterleave verifies that concurrent log calls to a
+// single non-locking writer are serialized: every record lands as an intact
+// line. Run with -race to also catch data races on the writer.
+func TestConcurrentHandleNoInterleave(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(NewHandler(WithWriter(&buf), WithColors(), WithoutTimestamp()))
+
+	const goroutines, perGoroutine = 16, 64
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < perGoroutine; i++ {
+				logger.Info("concurrent", "g", id, "i", i)
+			}
+		}(g)
+	}
+	wg.Wait()
+
+	got := strings.Count(buf.String(), "\n")
+	if want := goroutines * perGoroutine; got != want {
+		t.Errorf("expected %d intact lines, got %d (writes interleaved or lost)", want, got)
+	}
+}
+
+// TestWithForkedOutfileNoPanic verifies that an unopenable fork path degrades
+// gracefully instead of panicking, leaving the primary writer in place.
+func TestWithForkedOutfileNoPanic(t *testing.T) {
+	var buf bytes.Buffer
+	badPath := filepath.Join(os.TempDir(), "reef-does-not-exist", "nested", "app.log")
+
+	var handler *Handler
+	func() {
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("WithForkedOutfile panicked on bad path: %v", r)
+			}
+		}()
+		handler = NewHandler(WithWriter(&buf), WithForkedOutfile(badPath), WithoutTimestamp())
+	}()
+
+	slog.New(handler).Info("still works")
+	if !strings.Contains(buf.String(), "still works") {
+		t.Errorf("primary writer should still receive logs; got %q", buf.String())
+	}
+}
+
+// TestLevelWidth verifies the level value is padded to the configured width.
+func TestLevelWidth(t *testing.T) {
+	var buf bytes.Buffer
+	logger := slog.New(NewHandler(
+		WithWriter(&buf),
+		WithColors(),
+		WithLevelWidth(8),
+		WithoutTimestamp(),
+	))
+	logger.Info("msg")
+
+	// "INFO" padded to width 8 means four trailing spaces before the reset.
+	if want := "INFO" + strings.Repeat(" ", 4); !strings.Contains(buf.String(), want) {
+		t.Errorf("expected level padded to width 8 (%q); got %q", want, buf.String())
 	}
 }
