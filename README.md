@@ -65,7 +65,54 @@ app.Post("/users", handler)
 app.Put("/users/:id", handler)
 app.Delete("/users/:id", handler)
 app.Patch("/users/:id", handler)
+app.Query("/users", handler) // HTTP QUERY (RFC 10008): safe GET with a body
 ```
+
+`Head` and `Options` are available too, and `Query` registers the HTTP `QUERY`
+method — a safe, idempotent, cacheable request that carries its selection
+criteria in the body (read `r.Body` as you would for `POST`).
+
+#### QUERY (RFC 10008)
+
+A QUERY handler reads the request body just like POST, so `surf.Bind` /
+`surf.BindAndValidate` work unchanged:
+
+```go
+type UserQuery struct {
+    Status string `json:"status"`
+    Limit  int    `json:"limit"`
+}
+
+app.Query("/users", func(w http.ResponseWriter, r *http.Request) error {
+    var q UserQuery
+    if err := surf.BindAndValidate(r, &q); err != nil {
+        return err // 400 malformed / 413 too large / 415 wrong type / 422 invalid
+    }
+    return surf.JSONData(w, findUsers(q))
+})
+```
+
+For a fully typed pipeline (request **and** response types, plus `RouteInfo`
+capture for introspection), the existing `HandleJSON` helper already works with
+any method — pass `"QUERY"`:
+
+```go
+surf.HandleJSON(app, "QUERY", "/users",
+    func(c *surf.Context, q UserQuery) (UserList, error) {
+        return findUsers(q)
+    })
+```
+
+**Discovery.** Surf answers an `OPTIONS` request to any routed path
+automatically with `204 No Content` and an `Allow` header; when the path exposes
+a QUERY route it also emits `Accept-Query: application/json` (RFC 10008 §3) so
+clients can discover which body formats it accepts. This works even behind the
+CORS middleware — a genuine CORS preflight (one with
+`Access-Control-Request-Method`) is still short-circuited by CORS, but a plain
+`OPTIONS` probe falls through to the automatic handler. Configure the advertised
+formats with `surf.WithAcceptQuery(...)` (or pass none to suppress the header),
+set it on a specific response — e.g. a 415 — with `surf.SetAcceptQuery(w, ...)`,
+and disable the automatic OPTIONS handler with `surf.WithoutAutomaticOptions()`.
 
 ### Path Parameters
 
