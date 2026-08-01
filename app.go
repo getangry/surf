@@ -71,6 +71,10 @@ type App struct {
 	// when a QUERY route exists). When true, such a request falls through to the
 	// 405 path instead. Set with WithoutAutomaticOptions.
 	disableAutomaticOptions bool
+
+	// mcpTools holds the routes explicitly registered as MCP tools via
+	// MCPHandle, in registration order. Populated during app setup only.
+	mcpTools []mcpTool
 }
 
 // NewApp initializes a new Surf application instance with context and signal handling.

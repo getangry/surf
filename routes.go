@@ -41,6 +41,12 @@ type RouteInfo struct {
 	Style    RouteStyle
 	ReqType  reflect.Type
 	RespType reflect.Type
+
+	// SuccessStatus is the HTTP status a typed handler writes on success (200
+	// for HandleJSON/HandleQuery, the caller's status for HandleJSONStatus). It
+	// is 0 for routes registered with Get/Post/Handle, where the status is not
+	// known at registration time.
+	SuccessStatus int
 }
 
 // Routes returns a copy of the registered route metadata in registration
