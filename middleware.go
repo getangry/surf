@@ -9,6 +9,7 @@ import (
 	"runtime/debug"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -56,14 +57,28 @@ func CORS(config CORSConfig) Middleware {
 
 			// Check if origin is allowed
 			allowed := false
-			if len(config.AllowOrigins) == 0 || (len(config.AllowOrigins) == 1 && config.AllowOrigins[0] == "*") {
+			wildcard := len(config.AllowOrigins) == 0 || (len(config.AllowOrigins) == 1 && config.AllowOrigins[0] == "*")
+			if wildcard {
 				allowed = true
-				w.Header().Set("Access-Control-Allow-Origin", "*")
+				// "Access-Control-Allow-Origin: *" is invalid alongside
+				// credentials, and browsers reject the pair. When credentials
+				// are allowed, reflect the concrete origin instead and vary the
+				// cache on it so a shared cache cannot serve one origin's
+				// response to another.
+				if config.AllowCredentials && origin != "" {
+					w.Header().Set("Access-Control-Allow-Origin", origin)
+					w.Header().Add(headerVary, "Origin")
+				} else {
+					w.Header().Set("Access-Control-Allow-Origin", "*")
+				}
 			} else {
 				for _, o := range config.AllowOrigins {
 					if o == origin {
 						allowed = true
 						w.Header().Set("Access-Control-Allow-Origin", origin)
+						// The response body depends on Origin; mark it so caches
+						// key on the header instead of poisoning across origins.
+						w.Header().Add(headerVary, "Origin")
 						break
 					}
 				}
@@ -215,22 +230,37 @@ type RateLimitConfig struct {
 	SkipFunc func(r *http.Request) bool
 }
 
+// rateLimitIdleTTL is how long an idle client bucket is retained before it
+// becomes eligible for eviction, and rateLimitSweepInterval is the minimum gap
+// between eviction sweeps. Together they bound the memory the store can hold.
+const (
+	rateLimitIdleTTL       = 10 * time.Minute
+	rateLimitSweepInterval = time.Minute
+)
+
 // tokenBucket implements a simple token bucket rate limiter
 type tokenBucket struct {
 	tokens     float64
 	lastUpdate time.Time
 	rate       float64 // tokens per second
 	burst      float64 // max tokens
+	// lastAccess is the Unix-nanosecond time of the most recent allow(). It is
+	// read locklessly by the store's eviction sweep, so it is accessed
+	// atomically rather than under mu.
+	lastAccess atomic.Int64
 	mu         sync.Mutex
 }
 
 func newTokenBucket(rate float64, burst int) *tokenBucket {
-	return &tokenBucket{
+	now := time.Now()
+	tb := &tokenBucket{
 		tokens:     float64(burst),
-		lastUpdate: time.Now(),
+		lastUpdate: now,
 		rate:       rate,
 		burst:      float64(burst),
 	}
+	tb.lastAccess.Store(now.UnixNano())
+	return tb
 }
 
 func (tb *tokenBucket) allow() bool {
@@ -238,6 +268,7 @@ func (tb *tokenBucket) allow() bool {
 	defer tb.mu.Unlock()
 
 	now := time.Now()
+	tb.lastAccess.Store(now.UnixNano())
 	elapsed := now.Sub(tb.lastUpdate).Seconds()
 	tb.tokens += elapsed * tb.rate
 	if tb.tokens > tb.burst {
@@ -254,17 +285,21 @@ func (tb *tokenBucket) allow() bool {
 
 // rateLimiterStore stores rate limiters per client
 type rateLimiterStore struct {
-	limiters map[string]*tokenBucket
-	mu       sync.RWMutex
-	rate     float64
-	burst    int
+	limiters  map[string]*tokenBucket
+	mu        sync.RWMutex
+	rate      float64
+	burst     int
+	ttl       time.Duration
+	lastSweep time.Time
 }
 
 func newRateLimiterStore(rate float64, burst int) *rateLimiterStore {
 	return &rateLimiterStore{
-		limiters: make(map[string]*tokenBucket),
-		rate:     rate,
-		burst:    burst,
+		limiters:  make(map[string]*tokenBucket),
+		rate:      rate,
+		burst:     burst,
+		ttl:       rateLimitIdleTTL,
+		lastSweep: time.Now(),
 	}
 }
 
@@ -285,40 +320,54 @@ func (s *rateLimiterStore) get(key string) *tokenBucket {
 		return limiter
 	}
 
+	// Evict idle buckets before inserting a new one. Without this the map grows
+	// once per distinct key and never shrinks — an unbounded allocation when
+	// keys are numerous or attacker-influenced (e.g. spoofed forwarded IPs).
+	// Sweeping only on new-key insertion, and at most once per interval, keeps
+	// the steady-state cost negligible.
+	s.sweep()
+
 	limiter = newTokenBucket(s.rate, s.burst)
 	s.limiters[key] = limiter
 	return limiter
 }
 
-// DefaultRateLimitConfig returns a default rate limit configuration
+// sweep removes buckets idle for longer than ttl. The caller must hold the
+// write lock.
+func (s *rateLimiterStore) sweep() {
+	now := time.Now()
+	if now.Sub(s.lastSweep) < rateLimitSweepInterval {
+		return
+	}
+	cutoff := now.Add(-s.ttl).UnixNano()
+	for k, tb := range s.limiters {
+		if tb.lastAccess.Load() < cutoff {
+			delete(s.limiters, k)
+		}
+	}
+	s.lastSweep = now
+}
+
+// DefaultRateLimitConfig returns a default rate limit configuration.
+//
+// The default key is the connecting peer's address. X-Forwarded-For is honored
+// only when TrustedProxies is configured (see KeyByIP); trusting it
+// unconditionally would let any client bypass the limit — and exhaust the
+// limiter map — with a spoofed header.
 func DefaultRateLimitConfig() RateLimitConfig {
 	return RateLimitConfig{
 		RequestsPerSecond: 10,
 		Burst:             20,
-		KeyFunc: func(r *http.Request) string {
-			// Extract IP from RemoteAddr or X-Forwarded-For
-			if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-				parts := strings.Split(xff, ",")
-				return strings.TrimSpace(parts[0])
-			}
-			// Remove port from RemoteAddr
-			addr := r.RemoteAddr
-			if idx := strings.LastIndex(addr, ":"); idx != -1 {
-				addr = addr[:idx]
-			}
-			return addr
-		},
+		KeyFunc:           KeyByIP(),
 	}
 }
 
 // RateLimit creates a rate limiting middleware with the given configuration
 func RateLimit(config RateLimitConfig) Middleware {
 	if config.KeyFunc == nil {
-		if len(config.TrustedProxies) > 0 {
-			config.KeyFunc = KeyByIP(config.TrustedProxies...)
-		} else {
-			config.KeyFunc = DefaultRateLimitConfig().KeyFunc
-		}
+		// KeyByIP with an empty proxy list keys on the peer address and ignores
+		// X-Forwarded-For; with proxies it honors the header only from them.
+		config.KeyFunc = KeyByIP(config.TrustedProxies...)
 	}
 	if config.RequestsPerSecond <= 0 {
 		config.RequestsPerSecond = 10

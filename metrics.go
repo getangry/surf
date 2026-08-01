@@ -24,6 +24,25 @@ type counterKey struct {
 	status int
 }
 
+// knownMethods bounds the cardinality of the method label. Any HTTP token is a
+// valid request method, so an attacker could otherwise grow the counts map
+// without limit (and bloat the /metrics output) by sending unique methods.
+// Unrecognized methods are folded into "other".
+var knownMethods = map[string]struct{}{
+	http.MethodGet: {}, http.MethodHead: {}, http.MethodPost: {},
+	http.MethodPut: {}, http.MethodPatch: {}, http.MethodDelete: {},
+	http.MethodConnect: {}, http.MethodOptions: {}, http.MethodTrace: {},
+	"QUERY": {}, // RFC 10008, supported by surf's router
+}
+
+// normalizeMethod maps an arbitrary request method to a bounded label set.
+func normalizeMethod(method string) string {
+	if _, ok := knownMethods[method]; ok {
+		return method
+	}
+	return "other"
+}
+
 // MetricsRegistry collects per-request HTTP metrics and exposes them in the
 // Prometheus text exposition format. It has no external dependencies.
 //
@@ -61,7 +80,7 @@ func NewMetricsRegistryWithBuckets(buckets []float64) *MetricsRegistry {
 func (m *MetricsRegistry) record(method string, status int, d time.Duration) {
 	secs := d.Seconds()
 	m.mu.Lock()
-	m.counts[counterKey{method: method, status: status}]++
+	m.counts[counterKey{method: normalizeMethod(method), status: status}]++
 	m.durSum += secs
 	m.durCount++
 	for i, upper := range m.buckets {

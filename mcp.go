@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"net/url"
 	"reflect"
 	"strings"
 )
@@ -310,12 +311,21 @@ func (app *App) mcpInvoke(c *Context, tool mcpTool, args map[string]json.RawMess
 	bodyFields := make(map[string]json.RawMessage, len(args))
 	for k, v := range args {
 		if paramSet[k] {
-			// Path params substitute as their string value.
 			var sv string
 			if json.Unmarshal(v, &sv) != nil {
 				sv = strings.Trim(string(v), `"`)
 			}
-			path = strings.Replace(path, ":"+k, sv, 1)
+			// A path parameter fills exactly one path segment. The router
+			// matches on the decoded r.URL.Path, so a "/" in the value — even
+			// percent-encoded, which the URL layer decodes back — would split
+			// into extra segments and could route the in-process request to a
+			// different endpoint than the tool declares. Reject it outright.
+			if strings.ContainsRune(sv, '/') {
+				return http.StatusBadRequest, []byte(`{"error":"path parameter must not contain '/'"}`)
+			}
+			// PathEscape still guards other path-significant characters
+			// (?, #, space) that would otherwise alter the request target.
+			path = strings.Replace(path, ":"+k, url.PathEscape(sv), 1)
 			continue
 		}
 		bodyFields[k] = v

@@ -57,15 +57,22 @@ func hostOnly(addr string) string {
 // When trustedProxies is empty, the connecting peer's address (RemoteAddr) is
 // returned and X-Forwarded-For is ignored — the safe default, since the header
 // is client-controlled. When trustedProxies is non-empty and the peer is one
-// of them, X-Forwarded-For is walked from right to left and the first address
-// outside the trusted set is returned.
+// of them, X-Forwarded-For is walked from right to left and the first valid IP
+// address outside the trusted set is returned.
 func IPFromRequest(r *http.Request, trustedProxies []string) string {
+	return ipFromRequest(r, parseProxyNets(trustedProxies))
+}
+
+// ipFromRequest is the shared implementation working from pre-parsed nets so
+// KeyByIP can parse the trusted-proxy list once rather than on every request.
+func ipFromRequest(r *http.Request, nets []*net.IPNet) string {
 	remoteIP := hostOnly(r.RemoteAddr)
-	if len(trustedProxies) == 0 {
+	// An empty (or fully invalid) trusted-proxy set means we never honor the
+	// client-controlled header and fall back to the peer address.
+	if len(nets) == 0 {
 		return remoteIP
 	}
 
-	nets := parseProxyNets(trustedProxies)
 	if !ipInNets(remoteIP, nets) {
 		// The direct peer is not a trusted proxy; do not trust the header.
 		return remoteIP
@@ -81,6 +88,12 @@ func IPFromRequest(r *http.Request, trustedProxies []string) string {
 		if candidate == "" {
 			continue
 		}
+		// A forwarded entry that is not a valid IP address must never be
+		// returned as the client IP: it would otherwise flow into rate-limit
+		// keys and logs as attacker-authored text.
+		if net.ParseIP(candidate) == nil {
+			continue
+		}
 		if !ipInNets(candidate, nets) {
 			return candidate
 		}
@@ -90,9 +103,10 @@ func IPFromRequest(r *http.Request, trustedProxies []string) string {
 
 // KeyByIP returns a rate-limiter KeyFunc that identifies clients by IP address,
 // honoring X-Forwarded-For only for the given trusted proxy CIDRs/addresses.
+// The proxy list is parsed once, when KeyByIP is called, not per request.
 func KeyByIP(trustedProxies ...string) func(r *http.Request) string {
-	proxies := append([]string{}, trustedProxies...)
+	nets := parseProxyNets(trustedProxies)
 	return func(r *http.Request) string {
-		return IPFromRequest(r, proxies)
+		return ipFromRequest(r, nets)
 	}
 }
