@@ -90,6 +90,19 @@ func WithErrorHandler(renderer ErrorRenderer) Option {
 	}
 }
 
+// WithoutAutomaticOptions disables surf's built-in OPTIONS handler. By default,
+// an OPTIONS request to a path that has routes but no explicit OPTIONS handler
+// receives a 204 response carrying an Allow header (and, when the path exposes a
+// QUERY route, an Accept-Query header for RFC 10008 discovery). Use this option
+// to restore the older behavior where such requests fall through to the 405
+// path. An explicitly registered OPTIONS route always takes precedence either
+// way.
+func WithoutAutomaticOptions() Option {
+	return func(app *App) {
+		app.disableAutomaticOptions = true
+	}
+}
+
 // WithRedirectTrailingSlash enables automatic redirects between /foo and
 // /foo/ when only one variant of a path is registered. The redirect uses
 // HTTP 308 (Permanent Redirect), which preserves the request method and

@@ -1,6 +1,7 @@
 package surf
 
 import (
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -400,6 +401,7 @@ func TestAllHTTPMethods(t *testing.T) {
 		{app.Patch, "PATCH"},
 		{app.Head, "HEAD"},
 		{app.Options, "OPTIONS"},
+		{app.Query, "QUERY"},
 	}
 
 	for _, m := range methods {
@@ -424,5 +426,65 @@ func TestAllHTTPMethods(t *testing.T) {
 				t.Errorf("body = %q, want %q", rec.Body.String(), m.method)
 			}
 		})
+	}
+}
+
+// TestQueryMethod exercises the distinguishing feature of QUERY (RFC 10008):
+// a safe, idempotent request that carries selection criteria in its body.
+func TestQueryMethod(t *testing.T) {
+	app := NewApp()
+
+	app.Query("/search", func(w http.ResponseWriter, r *http.Request) error {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			return err
+		}
+		w.Write(body)
+		return nil
+	})
+
+	req := httptest.NewRequest("QUERY", "/search", strings.NewReader(`{"filter":"active"}`))
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if got := rec.Body.String(); got != `{"filter":"active"}` {
+		t.Errorf("body = %q, want the request body echoed back", got)
+	}
+
+	// A path with only a QUERY route must reject other methods with 405 and
+	// advertise QUERY in the Allow header.
+	getReq := httptest.NewRequest("GET", "/search", nil)
+	getRec := httptest.NewRecorder()
+	app.ServeHTTP(getRec, getReq)
+
+	if getRec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("GET status = %d, want %d", getRec.Code, http.StatusMethodNotAllowed)
+	}
+	if allow := getRec.Header().Get("Allow"); !strings.Contains(allow, "QUERY") {
+		t.Errorf("Allow header = %q, want it to contain QUERY", allow)
+	}
+}
+
+// TestGroupQueryMethod verifies QUERY registration through a route group.
+func TestGroupQueryMethod(t *testing.T) {
+	app := NewApp()
+	api := app.Group("/api")
+	api.Query("/users", func(w http.ResponseWriter, r *http.Request) error {
+		w.Write([]byte("ok"))
+		return nil
+	})
+
+	req := httptest.NewRequest("QUERY", "/api/users", strings.NewReader("{}"))
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", rec.Code, http.StatusOK)
+	}
+	if rec.Body.String() != "ok" {
+		t.Errorf("body = %q, want %q", rec.Body.String(), "ok")
 	}
 }

@@ -14,6 +14,7 @@ const (
 	headerContentEncoding = "Content-Encoding"
 	headerCacheControl    = "Cache-Control"
 	headerAllow           = "Allow"
+	headerAcceptQuery     = "Accept-Query"
 	headerVary            = "Vary"
 	headerXRequestID      = "X-Request-Id"
 	headerRetryAfter      = "Retry-After"
