@@ -1,0 +1,17 @@
+# gitleaks configuration for surf.
+#
+# Extends the built-in ruleset (useDefault) and adds a narrow allowlist for a
+# known-safe test fixture. The pre-push hook runs `gitleaks detect` from the
+# repo root, which auto-loads this file.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = """
+RFC 6455 §1.3 example Sec-WebSocket-Key ("dGhlIHNhbXBsZSBub25jZQ==", base64 for
+"the sample nonce"). It appears verbatim in websocket_test.go as a protocol
+fixture and is not a credential. Matched by the generic-api-key rule purely on
+its base64 shape. Allowlisted by exact value so real secrets are still caught.
+"""
+regexes = ['''dGhlIHNhbXBsZSBub25jZQ==''']

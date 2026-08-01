@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 )
 
@@ -179,6 +180,14 @@ func (app *App) Options(pattern string, handler HandlerFunc, middleware ...Middl
 	app.router.addRoute("OPTIONS", pattern, handler, middleware)
 }
 
+// Query registers a QUERY route with optional per-route middleware. QUERY
+// (RFC 10008) is a safe, idempotent, cacheable method that carries a request
+// body — a GET whose selection criteria travel in the body instead of the URL.
+// Read the enclosed content from r.Body as you would for POST.
+func (app *App) Query(pattern string, handler HandlerFunc, middleware ...Middleware) {
+	app.router.addRoute("QUERY", pattern, handler, middleware)
+}
+
 // Handle registers a fast-path route whose handler receives a pooled *Context.
 // Unlike Get/Post, the router copies neither the request nor allocates
 // per-request state, so a Context route has zero framework allocations — use
@@ -322,6 +331,12 @@ func (g *Group) Options(pattern string, handler HandlerFunc, middleware ...Middl
 	g.addRoute("OPTIONS", pattern, handler, middleware)
 }
 
+// Query registers a QUERY route (RFC 10008) in the group with optional
+// per-route middleware. See App.Query for the method's semantics.
+func (g *Group) Query(pattern string, handler HandlerFunc, middleware ...Middleware) {
+	g.addRoute("QUERY", pattern, handler, middleware)
+}
+
 // Handle registers a fast-path Context route under the group's prefix. Only
 // the prefix is applied — the group's HandlerFunc Before/After and Middleware
 // cannot wrap a CtxHandler; use CtxMiddleware for fast-path middleware.
@@ -439,21 +454,45 @@ func (app *App) dispatch(w http.ResponseWriter, r *http.Request) {
 	putContext(c)
 }
 
-// serveNoRoute writes the 405 or 404 response for an unmatched request.
+// serveNoRoute handles a request whose method did not match a route: an
+// automatic OPTIONS discovery response, a 405 when the path exists under other
+// methods, or a 404 otherwise.
 func (app *App) serveNoRoute(w http.ResponseWriter, r *http.Request) {
-	if allowed := app.router.getAllowedMethods(r.URL.Path); len(allowed) > 0 {
-		setKnownHeader(w.Header(), headerAllow, strings.Join(allowed, ", "))
-		if app.methodNotAllowed != nil {
-			app.methodNotAllowed(w, r)
+	allowed := app.router.getAllowedMethods(r.URL.Path)
+	if len(allowed) == 0 {
+		if app.notFoundHandler != nil {
+			app.notFoundHandler(w, r)
 		} else {
-			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			http.NotFound(w, r)
 		}
 		return
 	}
-	if app.notFoundHandler != nil {
-		app.notFoundHandler(w, r)
+
+	// The path exists under other methods. Answer an OPTIONS probe ourselves
+	// (unless disabled), so OPTIONS is part of what we advertise as allowed.
+	autoOptions := r.Method == http.MethodOptions && !app.disableAutomaticOptions
+	if autoOptions {
+		allowed = append(allowed, http.MethodOptions)
+	}
+	// Sort for a deterministic Allow header — getAllowedMethods ranges a map.
+	slices.Sort(allowed)
+	setKnownHeader(w.Header(), headerAllow, strings.Join(allowed, ", "))
+
+	// Advertise QUERY support (RFC 10008 §3) so a client that probes this path
+	// learns which query formats it may send.
+	if app.acceptQuery != "" && slices.Contains(allowed, "QUERY") {
+		setKnownHeader(w.Header(), headerAcceptQuery, app.acceptQuery)
+	}
+
+	if autoOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+
+	if app.methodNotAllowed != nil {
+		app.methodNotAllowed(w, r)
 	} else {
-		http.NotFound(w, r)
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 	}
 }
 

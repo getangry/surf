@@ -57,6 +57,20 @@ type App struct {
 	// redirectTrailingSlash toggles automatic 308 redirects between /foo
 	// and /foo/ when only one variant is registered. Off by default.
 	redirectTrailingSlash bool
+
+	// acceptQuery is the comma-separated media-type list advertised in the
+	// Accept-Query response header (RFC 10008 §3) on the automatic OPTIONS/405
+	// responses for any path that has a QUERY route. Defaults to
+	// "application/json"; an empty value disables the header. Configure with
+	// WithAcceptQuery.
+	acceptQuery string
+
+	// disableAutomaticOptions turns off the built-in OPTIONS handler. When
+	// false (the default), an OPTIONS request to a path that has routes but no
+	// explicit OPTIONS handler gets a 204 with an Allow header (and Accept-Query
+	// when a QUERY route exists). When true, such a request falls through to the
+	// 405 path instead. Set with WithoutAutomaticOptions.
+	disableAutomaticOptions bool
 }
 
 // NewApp initializes a new Surf application instance with context and signal handling.
@@ -68,6 +82,7 @@ func NewApp(options ...Option) *App {
 		router:       NewRouter(),
 		services:     make(map[any]any),
 		serverConfig: DefaultServerConfig(),
+		acceptQuery:  defaultAcceptQuery,
 	}
 
 	for _, opt := range options {

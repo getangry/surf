@@ -4,6 +4,42 @@ All notable changes to Surf are documented in this file.
 
 ## Unreleased
 
+### Routing
+
+#### Added
+
+- **`App.Query` / `Group.Query`** register routes for the HTTP `QUERY` method
+  ([RFC 10008](https://www.rfc-editor.org/rfc/rfc10008.html)) — a safe,
+  idempotent, cacheable method that carries a request body, giving you a `GET`
+  whose selection criteria travel in the body instead of the URL. Read the
+  enclosed content from `r.Body` as you would for `POST` (`surf.Bind` /
+  `BindAndValidate` work unchanged); for a fully typed pipeline, the existing
+  `HandleJSON`/`HandleJSONStatus` helpers accept `"QUERY"` as the method. The
+  default CORS config now advertises `QUERY` in `Access-Control-Allow-Methods`.
+- **Automatic `OPTIONS` handling.** An `OPTIONS` request to a path that has
+  routes but no explicit `OPTIONS` handler now returns `204 No Content` with a
+  sorted `Allow` header (previously it fell through to `405`). An explicitly
+  registered `OPTIONS` route still wins; disable the behavior with the new
+  **`WithoutAutomaticOptions()`** option. The `Allow` header is now sorted
+  deterministically on both the `OPTIONS` and `405` paths.
+- **`Accept-Query` advertising** (RFC 10008 §3). Any path with a `QUERY` route
+  emits `Accept-Query: application/json` on its automatic `OPTIONS`/`405`
+  responses so clients can discover QUERY support and the accepted body formats.
+  This works behind the CORS middleware: CORS now short-circuits only a genuine
+  preflight (one carrying `Access-Control-Request-Method`), letting a plain
+  `OPTIONS` probe reach the automatic handler. Configure the advertised media
+  types with **`WithAcceptQuery(...)`** (pass none to suppress the header), or
+  set it on a specific response — e.g. a 415 — with **`surf.SetAcceptQuery(w,
+  ...)`**.
+
+#### Changed
+
+- **CORS no longer short-circuits every `OPTIONS` request.** Only genuine
+  preflights (those with `Access-Control-Request-Method`) get the immediate
+  `204`; a plain `OPTIONS` falls through so the router's automatic handler can
+  answer with `Allow`/`Accept-Query`. CORS response headers are still set on
+  both.
+
 ### Logging (`pkg/logger/reef`)
 
 #### Performance

@@ -38,7 +38,7 @@ type CORSConfig struct {
 func DefaultCORSConfig() CORSConfig {
 	return CORSConfig{
 		AllowOrigins: []string{"*"},
-		AllowMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"},
+		AllowMethods: []string{"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS", "QUERY"},
 		AllowHeaders: []string{"Origin", "Content-Type", "Accept", "Authorization", "X-Requested-With"},
 		MaxAge:       86400, // 24 hours
 	}
@@ -91,8 +91,12 @@ func CORS(config CORSConfig) Middleware {
 				w.Header().Set("Access-Control-Max-Age", fmt.Sprintf("%d", config.MaxAge))
 			}
 
-			// Handle preflight request
-			if r.Method == http.MethodOptions {
+			// Answer a genuine CORS preflight (one carrying
+			// Access-Control-Request-Method) here. A plain OPTIONS request falls
+			// through so the router's automatic OPTIONS handler can respond with
+			// Allow / Accept-Query for RFC 10008 discovery instead of an opaque
+			// 204 that hides which methods the path supports.
+			if r.Method == http.MethodOptions && r.Header.Get("Access-Control-Request-Method") != "" {
 				w.WriteHeader(http.StatusNoContent)
 				return
 			}
