@@ -93,7 +93,7 @@ func mcpToolMeta(reqType reflect.Type) (name, desc string) {
 		return "", ""
 	}
 	t := reqType
-	for t.Kind() == reflect.Ptr {
+	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	if t.Kind() != reflect.Struct {

@@ -73,7 +73,7 @@ func SchemaFor(t reflect.Type) *Schema {
 // build converts a single Go type into a Schema node.
 func (b *schemaBuilder) build(t reflect.Type) *Schema {
 	// Unwrap pointers; nullability is expressed by omission from "required".
-	for t.Kind() == reflect.Ptr {
+	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 
@@ -145,7 +145,7 @@ func (b *schemaBuilder) objectSchema(t reflect.Type) *Schema {
 		// Promote embedded (anonymous) struct fields inline.
 		if f.Anonymous && name == "" {
 			ft := f.Type
-			for ft.Kind() == reflect.Ptr {
+			for ft.Kind() == reflect.Pointer {
 				ft = ft.Elem()
 			}
 			if ft.Kind() == reflect.Struct {
@@ -207,5 +207,5 @@ func isRequired(f reflect.StructField, omitempty bool) bool {
 	case "false":
 		return false
 	}
-	return f.Type.Kind() != reflect.Ptr && !omitempty
+	return f.Type.Kind() != reflect.Pointer && !omitempty
 }
