@@ -53,7 +53,7 @@ func HandleJSON[Req any, Resp any](
 		}
 		return c.JSON(http.StatusOK, resp)
 	}, middleware...)
-	captureTypes[Req, Resp](app)
+	captureTypes[Req, Resp](app, http.StatusOK)
 }
 
 // HandleJSONStatus is HandleJSON with a caller-specified success status
@@ -76,7 +76,7 @@ func HandleJSONStatus[Req any, Resp any](
 		}
 		return c.JSON(successStatus, resp)
 	}, middleware...)
-	captureTypes[Req, Resp](app)
+	captureTypes[Req, Resp](app, successStatus)
 }
 
 // HandleQuery registers a typed route with no request body — useful for GET
@@ -95,26 +95,29 @@ func HandleQuery[Resp any](
 		}
 		return c.JSON(http.StatusOK, resp)
 	}, middleware...)
-	captureRespType[Resp](app)
+	captureRespType[Resp](app, http.StatusOK)
 }
 
-// captureTypes populates the just-registered route's ReqType and RespType.
-// Route registration is expected to be single-threaded (during app setup),
-// so the post-append mutation is safe.
-func captureTypes[Req, Resp any](app *App) {
+// captureTypes populates the just-registered route's ReqType, RespType, and
+// SuccessStatus. Route registration is expected to be single-threaded (during
+// app setup), so the post-append mutation is safe.
+func captureTypes[Req, Resp any](app *App, successStatus int) {
 	n := len(app.router.routeInfo)
 	if n == 0 {
 		return
 	}
 	app.router.routeInfo[n-1].ReqType = reflect.TypeOf((*Req)(nil)).Elem()
 	app.router.routeInfo[n-1].RespType = reflect.TypeOf((*Resp)(nil)).Elem()
+	app.router.routeInfo[n-1].SuccessStatus = successStatus
 }
 
-// captureRespType populates only the just-registered route's RespType.
-func captureRespType[Resp any](app *App) {
+// captureRespType populates the just-registered route's RespType and
+// SuccessStatus (a response-only typed route has no request body).
+func captureRespType[Resp any](app *App, successStatus int) {
 	n := len(app.router.routeInfo)
 	if n == 0 {
 		return
 	}
 	app.router.routeInfo[n-1].RespType = reflect.TypeOf((*Resp)(nil)).Elem()
+	app.router.routeInfo[n-1].SuccessStatus = successStatus
 }

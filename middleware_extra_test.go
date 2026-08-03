@@ -95,9 +95,8 @@ func TestTimeout_HandlerObservesContextCancellation(t *testing.T) {
 func isDeadlineErr(err error) bool { return err == context.DeadlineExceeded }
 
 // RateLimit — middleware-level test with IPv6 peers using the safe KeyByIP
-// derivation (no trusted proxies). The default KeyFunc honors X-Forwarded-For
-// unconditionally — a separate, known shortcoming — so this test pins the
-// safe path explicitly via KeyByIP.
+// derivation (no trusted proxies), which keys on the peer address and ignores
+// X-Forwarded-For. This matches the default KeyFunc behavior.
 func TestRateLimit_IPv6Peer_KeyedByPeer(t *testing.T) {
 	app := NewApp()
 	app.Use(RateLimit(RateLimitConfig{

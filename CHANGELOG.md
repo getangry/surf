@@ -40,6 +40,52 @@ All notable changes to Surf are documented in this file.
   answer with `Allow`/`Accept-Query`. CORS response headers are still set on
   both.
 
+### Introspection (OpenAPI & MCP)
+
+#### Added
+
+- **OpenAPI 3.1 generation from typed routes.** `App.OpenAPI(APIInfo)` builds
+  a document from the registered routes, and `App.OpenAPIHandler(APIInfo)`
+  serves it as JSON (built once, then cached). Typed routes
+  (`HandleJSON`/`HandleJSONStatus`/`HandleQuery`) contribute full request and
+  response schemas derived by reflection over the captured `Req`/`Resp` types;
+  untyped routes degrade to method/path/params with a free-form response. Nested
+  named structs are deduplicated into `components.schemas` and referenced with
+  `$ref`. Typed routes now also capture their success status
+  (`RouteInfo.SuccessStatus`) so the document reports the right response code.
+- **MCP endpoint from typed routes.** `MCPHandle` registers a typed route and
+  additionally exposes it as a [Model Context Protocol](https://modelcontextprotocol.io)
+  tool; `App.MCP(pattern, MCPOptions)` mounts a JSON-RPC 2.0 endpoint speaking
+  `initialize`, `tools/list`, and `tools/call`. Exposure is always deliberate —
+  a route becomes a tool only through `MCPHandle` — and `MCPOptions.ExposeWhen`
+  gates each tool per request for both listing and calling. Tool name,
+  description, and argument metadata come from `desc`/`required` struct tags on
+  the embedded `surf.MCPRequest` marker. `tools/call` dispatches the real
+  handler in process through the full router, so binding, validation,
+  middleware, and error rendering behave identically to a live request.
+- **`SchemaFor(reflect.Type)`** exposes the reflection-based JSON Schema builder
+  (draft 2020-12 / OpenAPI 3.1 compatible) shared by all three introspection
+  consumers. Pointers are unwrapped, so a `*T` field is described as optional
+  (absent from `required`) rather than as nullable — the schema does not
+  represent explicit JSON `null`.
+
+#### Fixed
+
+- **`OpenAPIHandler` builds its cached document under a `sync.Once`.** The
+  lazy first build previously raced when concurrent requests arrived before the
+  cache was populated.
+- **MCP tool calls that omit a path parameter are rejected with `400`.** The
+  unfilled `:param` segment stayed in the path literally, still matched the
+  route, and ran the handler with `":param"` as the parameter value.
+- **The in-process MCP sub-request now carries the caller's `RemoteAddr` and
+  `Host`.** IP-keyed middleware (rate limiting, logging, trusted-proxy
+  resolution) previously saw an empty address on tool calls, so dispatching
+  through `tools/call` sidestepped it.
+- **Schema definitions no longer collide across packages.** Two distinct struct
+  types sharing a Go type name (`pkga.User` and `pkgb.User`) overwrote each
+  other in `$defs`/`components.schemas`, leaving `$ref`s pointing at the wrong
+  schema; later arrivals are now qualified with their package name.
+
 ### Logging (`pkg/logger/reef`)
 
 #### Performance
@@ -124,13 +170,39 @@ onto the post-v0.2.0 API.
   handler, and per-peer / spoofed-XFF behavior of the rate limiter when
   using `KeyByIP()`.
 
-### Known issue surfaced
+### Security
 
-- The legacy `DefaultRateLimitConfig().KeyFunc` still honors
-  `X-Forwarded-For` without proxy verification — a pre-v0.1.0 default
-  that `KeyByIP()` and `TrustedProxies` were meant to replace but never
-  made the default. Slated for a focused follow-up. Workaround today:
-  pass `KeyFunc: surf.KeyByIP(trustedProxies...)` explicitly.
+- **Rate limiter no longer trusts `X-Forwarded-For` by default.**
+  `DefaultRateLimitConfig().KeyFunc`, and the fallback used by
+  `RateLimit`/`RateLimitWithDefaults` when no `KeyFunc` is set, now key on
+  the connecting peer address via `KeyByIP()`. Previously the leftmost
+  `X-Forwarded-For` value was trusted unconditionally, so any client could
+  bypass the limit (and grow the limiter map without bound) with a spoofed,
+  rotating header. `X-Forwarded-For` is still honored when `TrustedProxies`
+  is configured.
+- **Rate-limiter map is now bounded.** Per-client token buckets that have
+  been idle longer than 10 minutes are evicted on insertion of a new key
+  (at most once per minute), so the store can no longer grow without limit
+  under many distinct or attacker-influenced keys.
+- **Forwarded IP parsing hardened.** `IPFromRequest` now skips
+  `X-Forwarded-For` entries that are not valid IP addresses instead of
+  returning the raw token, preventing attacker-authored strings from
+  becoming a client identity in rate-limit keys or logs. `KeyByIP` now
+  parses its trusted-proxy list once rather than on every request.
+- **Metrics method-label cardinality bounded.** `MetricsRegistry` folds any
+  unrecognized HTTP method into a single `other` label, so a client sending
+  arbitrary method tokens can no longer grow the counters map or inflate the
+  `/metrics` output.
+- **CORS: safer credentialed and cache behavior.** With credentials enabled,
+  a wildcard origin now reflects the concrete request origin instead of the
+  invalid `Access-Control-Allow-Origin: *` pairing, and every reflected
+  origin is accompanied by `Vary: Origin` to prevent cross-origin cache
+  poisoning.
+- **MCP tool calls reject path-injection.** A `tools/call` argument that maps
+  to a path parameter is rejected when it contains `/`, and other
+  path-significant characters are percent-escaped, so a tool call cannot
+  inject extra path segments and reach an endpoint other than the one the
+  tool declares.
 
 ## v0.2.0
 
