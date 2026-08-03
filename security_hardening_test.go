@@ -150,6 +150,55 @@ func TestMCP_NormalPathParamStillWorks(t *testing.T) {
 	}
 }
 
+// Omitting a path-parameter argument must be rejected outright. The unfilled
+// ":team" segment would otherwise stay in the path literally, still match the
+// route, and run the handler with ":team" as the parameter value.
+func TestMCP_MissingPathParamRejected(t *testing.T) {
+	app := newMCPApp(t, MCPOptions{})
+
+	resp := rpc(t, app, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":`+
+		`{"name":"create_user","arguments":{"name":"Ada"}}}`)
+	if resp.Error != nil {
+		t.Fatalf("unexpected JSON-RPC error: %+v", resp.Error)
+	}
+	result := resp.Result.(map[string]any)
+	if isErr, _ := result["isError"].(bool); !isErr {
+		t.Errorf("isError = false, want true for omitted path param; result=%v", result)
+	}
+	text := result["content"].([]any)[0].(map[string]any)["text"].(string)
+	if !contains(text, "missing required path parameter: team") {
+		t.Errorf("body = %q, want a missing-path-parameter rejection", text)
+	}
+}
+
+// The in-process sub-request must carry the caller's RemoteAddr, or IP-keyed
+// middleware (rate limiting, logging, trusted-proxy resolution) would see an
+// empty address and a tool call would become a way around it.
+func TestMCP_SubRequestCarriesRemoteAddr(t *testing.T) {
+	var gotAddr, gotHost string
+	app := NewApp()
+	MCPHandle(app, "POST", "/teams/:team/users",
+		func(c *Context, req mcpCreateReq) (mcpUser, error) {
+			gotAddr = c.Request.RemoteAddr
+			gotHost = c.Request.Host
+			return mcpUser{ID: c.Param("team"), Name: req.Name}, nil
+		})
+	app.MCP("/mcp", MCPOptions{})
+
+	resp := rpc(t, app, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":`+
+		`{"name":"create_user","arguments":{"team":"acme","name":"Ada"}}}`)
+	if resp.Error != nil {
+		t.Fatalf("unexpected JSON-RPC error: %+v", resp.Error)
+	}
+	// httptest.NewRequest, used by the rpc helper, sets these on the outer call.
+	if gotAddr != "192.0.2.1:1234" {
+		t.Errorf("sub-request RemoteAddr = %q, want the caller's 192.0.2.1:1234", gotAddr)
+	}
+	if gotHost != "example.com" {
+		t.Errorf("sub-request Host = %q, want the caller's example.com", gotHost)
+	}
+}
+
 // A specific allowed origin must be echoed with Vary: Origin to prevent shared
 // caches from serving one origin's response to another.
 func TestCORS_SpecificOriginSetsVary(t *testing.T) {

@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // APIInfo is the metadata block of a generated OpenAPI document.
@@ -136,11 +137,12 @@ func (app *App) OpenAPI(info APIInfo) *OpenAPIDoc {
 //
 //	app.Get("/openapi.json", app.OpenAPIHandler(surf.APIInfo{Title: "My API", Version: "1.0.0"}))
 func (app *App) OpenAPIHandler(info APIInfo) HandlerFunc {
-	var cached *OpenAPIDoc
+	var (
+		once   sync.Once
+		cached *OpenAPIDoc
+	)
 	return func(w http.ResponseWriter, r *http.Request) error {
-		if cached == nil {
-			cached = app.OpenAPI(info)
-		}
+		once.Do(func() { cached = app.OpenAPI(info) })
 		return JSON(w, http.StatusOK, cached)
 	}
 }

@@ -1,7 +1,9 @@
 package surf
 
 import (
+	"bytes"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -139,4 +141,44 @@ func TestSchemaRecursive(t *testing.T) {
 	if def.Properties["children"].Items.Ref != "#/$defs/schemaNode" {
 		t.Errorf("children items ref = %q, want self-ref", def.Properties["children"].Items.Ref)
 	}
+}
+
+// Two distinct struct types can share a Go type name across packages
+// (strings.Reader and bytes.Reader here). Keying $defs by the bare name alone
+// would make one overwrite the other and leave a $ref pointing at the wrong
+// schema, so the second arrival must get its own key.
+type schemaCollide struct {
+	A strings.Reader `json:"a"`
+	B bytes.Reader   `json:"b"`
+}
+
+func TestSchemaNameCollisionAcrossPackages(t *testing.T) {
+	s := SchemaFor(reflect.TypeOf(schemaCollide{}))
+	root := s.Defs["schemaCollide"]
+	if root == nil {
+		t.Fatal("schemaCollide missing from $defs")
+	}
+
+	refA := root.Properties["a"].Ref
+	refB := root.Properties["b"].Ref
+	if refA == "" || refB == "" {
+		t.Fatalf("both fields should be $refs, got a=%q b=%q", refA, refB)
+	}
+	if refA == refB {
+		t.Fatalf("strings.Reader and bytes.Reader collapsed onto one schema: %q", refA)
+	}
+	for _, ref := range []string{refA, refB} {
+		name := strings.TrimPrefix(ref, "#/$defs/")
+		if s.Defs[name] == nil {
+			t.Errorf("$ref %q has no matching definition; $defs keys=%v", ref, defKeys(s.Defs))
+		}
+	}
+}
+
+func defKeys(m map[string]*Schema) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }

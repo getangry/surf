@@ -1,7 +1,9 @@
 package surf
 
 import (
+	"path"
 	"reflect"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,12 +33,15 @@ var timeType = reflect.TypeOf(time.Time{})
 // registered in Defs and referenced with $ref, which both deduplicates repeated
 // types and terminates recursion on self-referential structs.
 type schemaBuilder struct {
-	// Defs holds every named struct schema, keyed by its Go type name. The
-	// caller decides where these land ("#/components/schemas/" for OpenAPI,
-	// "#/$defs/" for a standalone JSON Schema).
+	// Defs holds every named struct schema, keyed by its Go type name (see
+	// defName for how identically named types from different packages are kept
+	// apart). The caller decides where these land ("#/components/schemas/" for
+	// OpenAPI, "#/$defs/" for a standalone JSON Schema).
 	Defs    map[string]*Schema
 	refBase string
-	seen    map[reflect.Type]bool
+	// names records the Defs key assigned to each type already registered, and
+	// so doubles as the "already seen" set that terminates recursion.
+	names map[reflect.Type]string
 }
 
 // newSchemaBuilder returns a builder whose $ref pointers are prefixed with
@@ -45,7 +50,7 @@ func newSchemaBuilder(refBase string) *schemaBuilder {
 	return &schemaBuilder{
 		Defs:    make(map[string]*Schema),
 		refBase: refBase,
-		seen:    make(map[reflect.Type]bool),
+		names:   make(map[reflect.Type]string),
 	}
 }
 
@@ -72,7 +77,10 @@ func SchemaFor(t reflect.Type) *Schema {
 
 // build converts a single Go type into a Schema node.
 func (b *schemaBuilder) build(t reflect.Type) *Schema {
-	// Unwrap pointers; nullability is expressed by omission from "required".
+	// Unwrap pointers. *T and T therefore produce the same node: a pointer
+	// field is described as optional (omitted from "required"), which says
+	// nothing about whether an explicit JSON null is accepted. Nullability is
+	// not represented in the generated schema.
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
@@ -112,17 +120,59 @@ func (b *schemaBuilder) build(t reflect.Type) *Schema {
 // buildStruct registers t in Defs (if named) and returns a $ref to it; for
 // anonymous structs it returns the object schema inline.
 func (b *schemaBuilder) buildStruct(t reflect.Type) *Schema {
-	name := t.Name()
-	if name != "" {
-		ref := &Schema{Ref: b.refBase + name}
-		if b.seen[t] {
-			return ref
-		}
-		b.seen[t] = true
-		b.Defs[name] = b.objectSchema(t)
-		return ref
+	if t.Name() == "" {
+		return b.objectSchema(t)
 	}
-	return b.objectSchema(t)
+	if name, ok := b.names[t]; ok {
+		return &Schema{Ref: b.refBase + name}
+	}
+	name := b.defName(t)
+	b.names[t] = name
+	// Claim the key before recursing, so a same-named type reached from within
+	// this struct's fields sees it as taken and picks a different one.
+	b.Defs[name] = &Schema{}
+	b.Defs[name] = b.objectSchema(t)
+	return &Schema{Ref: b.refBase + name}
+}
+
+// defName picks a unique Defs key for the named struct type t. The plain type
+// name is used when it is free; two distinct types sharing a name (pkga.User
+// and pkgb.User) would otherwise overwrite each other and leave $refs pointing
+// at the wrong schema, so later arrivals are qualified with their package name
+// and, failing that, a counter.
+func (b *schemaBuilder) defName(t reflect.Type) string {
+	name := t.Name()
+	if _, taken := b.Defs[name]; !taken {
+		return name
+	}
+	if pkg := sanitizeDefName(path.Base(t.PkgPath())); pkg != "" && pkg != "." {
+		qualified := pkg + "_" + name
+		if _, taken := b.Defs[qualified]; !taken {
+			return qualified
+		}
+		name = qualified
+	}
+	for i := 2; ; i++ {
+		candidate := name + strconv.Itoa(i)
+		if _, taken := b.Defs[candidate]; !taken {
+			return candidate
+		}
+	}
+}
+
+// sanitizeDefName strips characters that are not safe in an OpenAPI component
+// key or a JSON Pointer fragment (a package directory such as "yaml.v3" is
+// fine; "/" and "~" are not).
+func sanitizeDefName(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9',
+			r == '.', r == '-', r == '_':
+			return r
+		default:
+			return '_'
+		}
+	}, s)
 }
 
 // objectSchema builds the properties/required for a struct type. It honors the

@@ -65,7 +65,26 @@ All notable changes to Surf are documented in this file.
   middleware, and error rendering behave identically to a live request.
 - **`SchemaFor(reflect.Type)`** exposes the reflection-based JSON Schema builder
   (draft 2020-12 / OpenAPI 3.1 compatible) shared by all three introspection
-  consumers.
+  consumers. Pointers are unwrapped, so a `*T` field is described as optional
+  (absent from `required`) rather than as nullable — the schema does not
+  represent explicit JSON `null`.
+
+#### Fixed
+
+- **`OpenAPIHandler` builds its cached document under a `sync.Once`.** The
+  lazy first build previously raced when concurrent requests arrived before the
+  cache was populated.
+- **MCP tool calls that omit a path parameter are rejected with `400`.** The
+  unfilled `:param` segment stayed in the path literally, still matched the
+  route, and ran the handler with `":param"` as the parameter value.
+- **The in-process MCP sub-request now carries the caller's `RemoteAddr` and
+  `Host`.** IP-keyed middleware (rate limiting, logging, trusted-proxy
+  resolution) previously saw an empty address on tool calls, so dispatching
+  through `tools/call` sidestepped it.
+- **Schema definitions no longer collide across packages.** Two distinct struct
+  types sharing a Go type name (`pkga.User` and `pkgb.User`) overwrote each
+  other in `$defs`/`components.schemas`, leaving `$ref`s pointing at the wrong
+  schema; later arrivals are now qualified with their package name.
 
 ### Logging (`pkg/logger/reef`)
 

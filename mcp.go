@@ -303,14 +303,15 @@ func (app *App) mcpToolsCall(c *Context, req jsonrpcRequest, opts MCPOptions) js
 // downstream auth middleware sees the same identity.
 func (app *App) mcpInvoke(c *Context, tool mcpTool, args map[string]json.RawMessage) (int, []byte) {
 	path := tool.route.Pattern
-	paramSet := make(map[string]bool, len(tool.route.Params))
+	// filled tracks each path parameter and whether the call supplied it.
+	filled := make(map[string]bool, len(tool.route.Params))
 	for _, p := range tool.route.Params {
-		paramSet[p] = true
+		filled[p] = false
 	}
 
 	bodyFields := make(map[string]json.RawMessage, len(args))
 	for k, v := range args {
-		if paramSet[k] {
+		if _, isParam := filled[k]; isParam {
 			var sv string
 			if json.Unmarshal(v, &sv) != nil {
 				sv = strings.Trim(string(v), `"`)
@@ -326,9 +327,20 @@ func (app *App) mcpInvoke(c *Context, tool mcpTool, args map[string]json.RawMess
 			// PathEscape still guards other path-significant characters
 			// (?, #, space) that would otherwise alter the request target.
 			path = strings.Replace(path, ":"+k, url.PathEscape(sv), 1)
+			filled[k] = true
 			continue
 		}
 		bodyFields[k] = v
+	}
+
+	// Every path parameter must be supplied. An unfilled ":param" stays in the
+	// path literally, which still matches the same route — the handler would
+	// then run against a nonsense parameter value instead of failing cleanly.
+	for _, p := range tool.route.Params {
+		if !filled[p] {
+			msg, _ := json.Marshal(map[string]string{"error": "missing required path parameter: " + p})
+			return http.StatusBadRequest, msg
+		}
 	}
 
 	bodyBytes, _ := json.Marshal(bodyFields)
@@ -343,6 +355,11 @@ func (app *App) mcpInvoke(c *Context, tool mcpTool, args map[string]json.RawMess
 		sub.Header[k] = vals
 	}
 	sub.Header.Set("Content-Type", "application/json")
+	// Carry the caller's identity onto the sub-request so IP-keyed middleware
+	// (rate limiting, logging, trusted-proxy resolution) sees the real client
+	// rather than an empty address — a tool call must not be a way around it.
+	sub.RemoteAddr = c.Request.RemoteAddr
+	sub.Host = c.Request.Host
 
 	rec := &mcpRecorder{}
 	app.ServeHTTP(rec, sub)

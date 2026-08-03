@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"testing"
 )
 
@@ -108,4 +109,33 @@ func keys(m map[string]*Response) []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// OpenAPIHandler caches the generated document. Building it lazily on first use
+// must be synchronized, or concurrent first requests race on the cache.
+func TestOpenAPIHandlerConcurrent(t *testing.T) {
+	app := NewApp()
+	HandleJSON(app, "POST", "/users",
+		func(c *Context, req oaCreateReq) (oaUser, error) { return oaUser{}, nil })
+	app.Get("/openapi.json", app.OpenAPIHandler(APIInfo{Title: "T", Version: "1"}))
+
+	const n = 16
+	var wg sync.WaitGroup
+	bodies := make([]string, n)
+	for i := range n {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			rec := httptest.NewRecorder()
+			app.ServeHTTP(rec, httptest.NewRequest("GET", "/openapi.json", nil))
+			bodies[i] = rec.Body.String()
+		}()
+	}
+	wg.Wait()
+
+	for i, b := range bodies {
+		if b == "" || b != bodies[0] {
+			t.Fatalf("request %d returned a different document than request 0", i)
+		}
+	}
 }
