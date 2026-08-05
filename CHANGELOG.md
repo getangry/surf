@@ -40,6 +40,31 @@ All notable changes to Surf are documented in this file.
   answer with `Allow`/`Accept-Query`. CORS response headers are still set on
   both.
 
+#### Performance
+
+- **Iterative radix lookup.** `searchNodeKV` no longer recurses. It walks the
+  tree with an explicit backtracking stack held inline (8 frames) on the
+  goroutine stack, and pushes a frame only at a node that actually has an
+  untried param or wildcard alternative — a purely static or single-param
+  route now resolves with no backtracking state at all. Static children of a
+  node never share a leading byte (insert splits on the common prefix), so at
+  most one can prefix-match; the walk checks that byte before the `HasPrefix`
+  call. Behavior is unchanged, and a new property test
+  (`radix_property_test.go`) checks the iterative walk against the old
+  recursive one over hundreds of randomly generated trees, plus asserts the
+  disjoint-siblings invariant the walk relies on.
+- **Allocation-free string responses.** `ResponseWriter.WriteString` now
+  prefers the underlying writer's own `WriteString` when it has one, and
+  otherwise passes the string to `Write` as a borrowed byte view instead of
+  going through `io.WriteString`, whose fallback copies into a fresh
+  `[]byte`. `c.String` responses no longer allocate. (`io.Writer` already
+  forbids implementations from modifying or retaining the slice they are
+  given, which is what makes the view safe.)
+- Together, on an Apple M4: the fast path's param route goes **66.9 ns / 2
+  allocs → 57.5 ns / 1 alloc**, and its static route **55.5 ns / 2 allocs →
+  46.5 ns / 1 alloc** — level with echo (55.1 ns) and within ~10% of gin
+  (52.4 ns). See `PERFORMANCE.md`.
+
 ### Introspection (OpenAPI & MCP)
 
 #### Added

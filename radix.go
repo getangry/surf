@@ -126,48 +126,126 @@ func (t *radixTree) searchKV(path string, params *[]paramKV) *route {
 	return t.searchNodeKV(t.root, path, params)
 }
 
-// searchNodeKV walks the tree from node. It tries static children first
-// (most specific), then the param child, then the wildcard child.
-func (t *radixTree) searchNodeKV(node *radixNode, path string, params *[]paramKV) *route {
-	if len(path) == 0 {
-		return node.handler
-	}
+// Stages of the per-node match order: static children (most specific), then
+// the param child, then the wildcard child.
+const (
+	stageArrive = iota // just landed on a node; test it for a terminal match
+	stageStatic
+	stageParam
+	stageWildcard
+	stageBacktrack
+)
 
-	// Static children — direct slice walk with no type filter.
-	for _, child := range node.staticChildren {
-		if strings.HasPrefix(path, child.path) {
-			if r := t.searchNodeKV(child, path[len(child.path):], params); r != nil {
-				return r
-			}
+// radixFrame is a backtracking point: a node that still has an untried param
+// or wildcard alternative, the path that remained at that node, and the
+// parameter count to restore before the alternative is tried.
+type radixFrame struct {
+	node  *radixNode
+	path  string
+	mark  int
+	param bool // true if the param child is the next alternative, else wildcard
+}
+
+// inlineFrames is the number of backtracking frames kept inline on the stack.
+// A frame is only pushed at a node that has a param or wildcard child, so
+// realistic route trees never come close; deeper ones spill to the heap and
+// still match correctly.
+const inlineFrames = 8
+
+// staticChildFor returns the one static child whose path prefixes the given
+// path, or nil. At most one can match: insert splits static children on their
+// longest common prefix, so siblings never share a leading byte — which is
+// why the walk below only ever backtracks over param and wildcard children.
+func (n *radixNode) staticChildFor(path string) *radixNode {
+	first := path[0]
+	for _, child := range n.staticChildren {
+		if child.path[0] == first && strings.HasPrefix(path, child.path) {
+			return child
 		}
 	}
-
-	// Param child — at most one. Match up to the next "/" or end.
-	if pc := node.paramChild; pc != nil {
-		end := strings.IndexByte(path, '/')
-		var value, remaining string
-		if end == -1 {
-			value, remaining = path, ""
-		} else {
-			value, remaining = path[:end], path[end:]
-		}
-		if value != "" {
-			mark := len(*params)
-			*params = append(*params, paramKV{key: pc.paramKey, val: value})
-			if r := t.searchNodeKV(pc, remaining, params); r != nil {
-				return r
-			}
-			*params = (*params)[:mark]
-		}
-	}
-
-	// Wildcard child — at most one. Captures the entire remaining path.
-	if wc := node.wildcardChild; wc != nil {
-		*params = append(*params, paramKV{key: "*", val: path})
-		return wc.handler
-	}
-
 	return nil
+}
+
+// searchNodeKV walks the tree from node iteratively, with an explicit
+// backtracking stack in place of recursion. Match order at each node is
+// static child, then param child, then wildcard child.
+func (t *radixTree) searchNodeKV(node *radixNode, path string, params *[]paramKV) *route {
+	var buf [inlineFrames]radixFrame
+	stack := buf[:0]
+
+	entry := len(*params)
+	rest, mark, stage := path, entry, stageArrive
+
+	for {
+		switch stage {
+		case stageArrive:
+			// A node reached with nothing left to match is a hit only if it
+			// is itself terminal; its children are not consulted.
+			if len(rest) == 0 {
+				if node.handler != nil {
+					return node.handler
+				}
+				stage = stageBacktrack
+				continue
+			}
+			stage = stageStatic
+
+		case stageStatic:
+			stage = stageParam
+			child := node.staticChildFor(rest)
+			if child == nil {
+				continue
+			}
+			if node.paramChild != nil || node.wildcardChild != nil {
+				stack = append(stack, radixFrame{node: node, path: rest, mark: mark, param: true})
+			}
+			node, rest, stage = child, rest[len(child.path):], stageArrive
+
+		case stageParam:
+			stage = stageWildcard
+			pc := node.paramChild
+			if pc == nil {
+				continue
+			}
+			// A param matches up to the next "/" or the end of the path.
+			var value, remaining string
+			if end := strings.IndexByte(rest, '/'); end == -1 {
+				value = rest
+			} else {
+				value, remaining = rest[:end], rest[end:]
+			}
+			if value == "" {
+				continue
+			}
+			if node.wildcardChild != nil {
+				stack = append(stack, radixFrame{node: node, path: rest, mark: mark, param: false})
+			}
+			*params = append(*params, paramKV{key: pc.paramKey, val: value})
+			node, rest, mark, stage = pc, remaining, len(*params), stageArrive
+
+		case stageWildcard:
+			stage = stageBacktrack
+			if wc := node.wildcardChild; wc != nil && wc.handler != nil {
+				*params = append(*params, paramKV{key: "*", val: rest})
+				return wc.handler
+			}
+
+		case stageBacktrack:
+			if len(stack) == 0 {
+				*params = (*params)[:entry]
+				return nil
+			}
+			f := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			*params = (*params)[:f.mark]
+			node, rest, mark = f.node, f.path, f.mark
+			if f.param {
+				stage = stageParam
+			} else {
+				stage = stageWildcard
+			}
+		}
+	}
 }
 
 // search returns the matched route plus parameters as a map. Used by tests
