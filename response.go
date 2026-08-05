@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"sync"
 	"time"
+	"unsafe"
 )
 
 // ResponseWriter wraps http.ResponseWriter to track response metrics and
@@ -70,14 +71,39 @@ func (rw *ResponseWriter) recycle() {
 
 // WriteString writes s to the response, tracking size like Write. It lets
 // callers avoid a []byte conversion for string responses.
+//
+// The underlying writer's own WriteString is preferred when it has one
+// (net/http's response does). Otherwise the string is handed to Write as a
+// borrowed byte view rather than a copy, so a string response allocates
+// nothing. io.Writer already forbids implementations from modifying or
+// retaining the slice they are given, which is exactly what makes the view
+// safe; a writer that violates that contract would corrupt the caller's
+// string.
 func (rw *ResponseWriter) WriteString(s string) (int, error) {
 	if !rw.wroteHeader {
 		rw.WriteHeader(http.StatusOK)
 	}
-	n, err := io.WriteString(rw.ResponseWriter, s)
+	var (
+		n   int
+		err error
+	)
+	if sw, ok := rw.ResponseWriter.(io.StringWriter); ok {
+		n, err = sw.WriteString(s)
+	} else {
+		n, err = rw.ResponseWriter.Write(stringView(s))
+	}
 	rw.size += n
 	rw.written = true
 	return n, err
+}
+
+// stringView returns a []byte aliasing s's bytes without copying them. The
+// result must never be modified or retained past the call it is passed to.
+func stringView(s string) []byte {
+	if len(s) == 0 {
+		return nil
+	}
+	return unsafe.Slice(unsafe.StringData(s), len(s))
 }
 
 // WriteHeader captures the status code and writes the header

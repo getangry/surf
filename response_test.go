@@ -348,3 +348,89 @@ func TestRenderErrorPreservesCommittedResponse(t *testing.T) {
 			rec.Code, rec.Body.String())
 	}
 }
+
+// plainRW is an http.ResponseWriter with no WriteString method, forcing
+// ResponseWriter.WriteString down its borrowed-byte-view path.
+type plainRW struct {
+	header http.Header
+	body   []byte
+	status int
+}
+
+func (p *plainRW) Header() http.Header {
+	if p.header == nil {
+		p.header = http.Header{}
+	}
+	return p.header
+}
+func (p *plainRW) Write(b []byte) (int, error) { p.body = append(p.body, b...); return len(b), nil }
+func (p *plainRW) WriteHeader(status int)      { p.status = status }
+
+func TestWriteStringWithoutStringWriter(t *testing.T) {
+	plain := &plainRW{}
+	rw := NewResponseWriter(plain)
+
+	n, err := rw.WriteString("hello")
+	if err != nil {
+		t.Fatalf("write error: %v", err)
+	}
+	if n != 5 {
+		t.Errorf("bytes written = %d, want 5", n)
+	}
+	if string(plain.body) != "hello" {
+		t.Errorf("body = %q, want %q", plain.body, "hello")
+	}
+	if rw.Size() != 5 {
+		t.Errorf("size = %d, want 5", rw.Size())
+	}
+	if !rw.Written() {
+		t.Error("written flag should be true")
+	}
+	if plain.status != http.StatusOK {
+		t.Errorf("status = %d, want %d", plain.status, http.StatusOK)
+	}
+
+	// An empty string still commits the response but writes no bytes.
+	plain2 := &plainRW{}
+	rw2 := NewResponseWriter(plain2)
+	if n, err = rw2.WriteString(""); err != nil || n != 0 {
+		t.Fatalf("empty write = (%d, %v), want (0, nil)", n, err)
+	}
+	if len(plain2.body) != 0 {
+		t.Errorf("body = %q, want empty", plain2.body)
+	}
+	if !rw2.Written() {
+		t.Error("written flag should be true after an empty write")
+	}
+}
+
+func TestWriteStringUsesUnderlyingStringWriter(t *testing.T) {
+	// httptest.ResponseRecorder implements io.StringWriter, so this exercises
+	// the delegating branch.
+	rec := httptest.NewRecorder()
+	rw := NewResponseWriter(rec)
+
+	if _, err := rw.WriteString("hello"); err != nil {
+		t.Fatalf("write error: %v", err)
+	}
+	if got := rec.Body.String(); got != "hello" {
+		t.Errorf("body = %q, want %q", got, "hello")
+	}
+	if rw.Size() != 5 {
+		t.Errorf("size = %d, want 5", rw.Size())
+	}
+}
+
+func TestWriteStringDoesNotAllocate(t *testing.T) {
+	plain := &plainRW{body: make([]byte, 0, 1<<12)}
+	rw := NewResponseWriter(plain)
+	rw.WriteHeader(http.StatusOK)
+
+	allocs := testing.AllocsPerRun(100, func() {
+		plain.body = plain.body[:0]
+		_, _ = rw.WriteString("hello")
+	})
+	if allocs != 0 {
+		t.Errorf("WriteString allocated %v times per call, want 0", allocs)
+	}
+}

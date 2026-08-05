@@ -1,25 +1,29 @@
 # Performance Roadmap
 
-This document records where surf's request hot path currently spends its time
-and the ranked plan for closing the remaining gap to gin and echo. It is a
-roadmap for a future release — **v0.1.0 ships with the numbers below as-is.**
+This document records where surf's request hot path spends its time and the
+ranked plan for closing the remaining gap to gin and echo. Items 1–4 of the
+original plan have landed; what remains is item 5 (deliberately skipped) and
+the open questions at the bottom.
 
-## Current state (v0.1.0)
+## Current state (unreleased)
 
-Isolated param-route benchmark (`benchmarks/`, Apple Silicon, Go 1.26):
+Isolated param-route benchmark (`benchmarks/`, Apple M4, Go 1.25):
 
-| Router | ns/op | allocs/op |
-|---|---|---|
-| `net/http.ServeMux` | 80 | 2 |
-| gin | 55 | 1 |
-| echo | 57 | 1 |
-| chi | 196 | 5 |
-| surf — standard `func(w, r)` | 160 | 3 |
-| surf — fast path `App.Handle` | ~100 | 2 |
+| Router | ns/op | B/op | allocs/op |
+|---|---|---|---|
+| gin | 52 | 48 | 1 |
+| echo | 55 | 8 | 1 |
+| **surf — fast path `App.Handle`** | **58** | **16** | **1** |
+| `net/http.ServeMux` | 75 | 24 | 2 |
+| surf — standard `func(w, r)` | 154 | 744 | 3 |
+| chi | 187 | 712 | 5 |
 
-surf's fast path is ~2x faster than chi and in the same tier as stdlib
-`ServeMux`. gin and echo remain ~1.8x faster. v0.1.0 reduced the standard path
-from 416 ns/14 allocs; this roadmap is about the fast path.
+The fast path is now level with echo and within ~10% of gin, ~1.3x faster than
+stdlib `ServeMux`, and ~3x faster than chi. The static-route benchmark tells
+the same story (surf-fast 46 ns, gin 45 ns, echo 47 ns).
+
+For reference, the fast path started at ~100 ns / 2 allocs when this roadmap
+was written, and the standard path started at 416 ns / 14 allocs in v0.1.0.
 
 Reproduce:
 
@@ -30,9 +34,10 @@ go test -bench='BenchmarkParamRoute/surf-fast' -cpuprofile=cpu.prof -run='^$' -b
 go tool pprof -top -cum cpu.prof
 ```
 
-## Profile findings
+## Original profile findings
 
-CPU profile of `BenchmarkParamRoute/surf-fast`, cumulative attribution:
+CPU profile of `BenchmarkParamRoute/surf-fast` when the roadmap was written,
+cumulative attribution:
 
 | Cost | % of request | Source |
 |---|---|---|
@@ -41,72 +46,73 @@ CPU profile of `BenchmarkParamRoute/surf-fast`, cumulative attribution:
 | radix `searchNodeKV` | ~9% | recursive walk with a per-node child-type scan |
 | `sync.Pool.Get` | ~2.5% | Context checkout — largely irreducible |
 
-> **Platform caveat.** This profile is from macOS/Apple Silicon, where
+> **Platform caveat.** These profiles are from macOS/Apple Silicon, where
 > `time.Now()` (`runtime.walltime` + `nanotime1`) and GC `madvise` are more
 > expensive than on Linux. Re-profile on the target Linux production
-> architecture before committing to the rewrite items — the *ranking* should
+> architecture before committing to further rewrites — the *ranking* should
 > hold, but the absolute percentages will shift.
 
 ## Ranked plan
 
-### 1. Drop `time.Now()` from the hot path — ~25%, low effort, low risk
+### 1. Drop `time.Now()` from the hot path — ~25% — **done**
 
-`ResponseWriter.startTime` is set unconditionally in `initWriter`/`NewResponseWriter`
-but is only read by `Latency()` / `StartTime()`, which only the template
-logging middleware uses. A request that is not being timed pays a `time.Now()`
-for nothing.
+`ResponseWriter.StartTime` is no longer set by the framework. It is exported
+and left as the zero value; the timing consumers (the `Logging*` middlewares)
+record their own start time, and `Latency()` returns 0 when `StartTime` was
+never set. A request that is not being timed pays nothing.
 
-Plan: stop setting `startTime` in the fast-path `initWriter`. Have the timing
-consumers (the `Logging*` middlewares) record their own start time — most
-already do (`Logger` calls `time.Now()` itself). Alternatively make `startTime`
-lazy: set it on first `Latency()` call, or gate it behind a `WithRequestTiming`
-option.
+### 2. Canonical-key-free header writes — ~3% — **done**
 
-Expected: ~100 ns → ~78 ns. This single change moves the fast path into
-stdlib `ServeMux` territory.
+`setKnownHeader` (`headers.go`) writes known response headers straight into
+the header map under their pre-canonicalized keys, skipping
+`net/textproto.CanonicalMIMEHeaderKey` on keys that are already canonical.
 
-### 2. Canonical-key-free header writes — ~3%, low effort, low risk
+### 3. Allocation-free string responses — ~9% — **done**
 
-`c.String` calls `Header().Set("Content-Type", …)`, which runs
-`net/textproto.CanonicalMIMEHeaderKey` on a key that is already canonical.
+`ResponseWriter.WriteString` previously went through `io.WriteString`, which
+falls back to `w.Write([]byte(s))` — one allocation per response — whenever
+the underlying writer does not implement `io.StringWriter`. It now delegates
+to the writer's own `WriteString` when there is one (net/http's `response` has
+one) and otherwise hands `Write` a borrowed byte view of the string.
 
-Plan: write known response headers (`Content-Type`, `Content-Length`) directly
-into the header map under their pre-canonicalized keys, or cache a canonical
-`textproto.MIMEHeader` key constant.
+The view is safe because `io.Writer` already requires implementations not to
+modify or retain the slice they are passed; a writer that violates that
+contract would corrupt the caller's string. That constraint is documented on
+both `WriteString` and the internal `stringView` helper.
 
-### 3. Allocation-free string responses — ~9%, medium effort
+### 4. Iterative radix lookup — ~9% — **done**
 
-`Context.String` → `ResponseWriter.WriteString` → `io.WriteString`. When the
-underlying writer does not implement `io.StringWriter` (the common case for
-`http.ResponseWriter`), `io.WriteString` falls back to `w.Write([]byte(s))` —
-one allocation per response.
+`searchNodeKV` walks the tree with an explicit backtracking stack (8 frames
+inline, spilling to the heap only for pathologically deep trees) instead of
+recursing. Two things keep it cheap:
 
-Plan: investigate writing strings without the `[]byte` conversion (e.g. an
-internal unsafe string→[]byte view for the write call, used only for the
-duration of `Write`). This is the one item with real subtlety; measure
-carefully and keep it behind the existing `WriteString` method.
+- `radixNode` already splits children into `staticChildren`, `paramChild`, and
+  `wildcardChild`, so no per-node type filtering is needed.
+- `insert` splits static children on their longest common prefix, so a node's
+  static children never share a leading byte and **at most one** can
+  prefix-match a path. Static descent is therefore deterministic, and a
+  backtracking frame is pushed only where a param or wildcard alternative
+  genuinely remains. A static route, or `/users/:id`, pushes nothing.
 
-### 4. Iterative radix lookup — ~9% → ~4-5%, medium effort, medium risk
-
-`searchNodeKV` recurses and, at each node, scans children three times (static,
-param, wildcard). Routers like httprouter keep child kinds in separate fields
-and walk iteratively with an explicit backtrack stack.
-
-Plan: rework `radixNode` so static children, the single param child, and the
-wildcard child are distinct fields; convert `searchNodeKV` to an iterative walk
-with a small fixed-size backtracking stack. This touches the routing core —
-gate it behind the full `radix_test.go` suite plus new property tests.
+`radix_property_test.go` guards the rewrite: it checks the iterative walk
+against the previous recursive implementation (kept as an oracle) over
+hundreds of randomly generated trees and paths, and separately asserts the
+disjoint-static-siblings invariant the walk depends on.
 
 ### 5. `sync.Pool` overhead — ~2.5%, not worth pursuing
 
 Largely irreducible and already cheap. Leave it.
 
-## Projected outcome
+## What's left
 
-Items 1 + 2 + 4 together (~37% on this machine) would bring the fast path from
-~100 ns to roughly ~65-75 ns — competitive with gin and echo. Item 3 removes
-the last allocation for string responses. None of these require an API change;
-they are all internal to the fast path and the router.
+The fast path is down to a single allocation per request: the one-element
+`[]string` that `setKnownHeader` stores in the header map for `Content-Type`.
+Removing it would mean caching a pre-built `[]string` per known value, which
+is only safe if nothing ever mutates the response header map's slices in
+place — worth measuring before attempting, and worth roughly 16 B/op.
 
-The work should land in a dedicated `v0.1.1` performance release, each item as
-its own reviewable commit, re-profiled on Linux first.
+A re-profile after items 1–4 shows the remaining request time split between
+`Context.String` (~15%), the radix lookup (~11%), and `setKnownHeader` (~11%),
+with GC (`madvise`/`kevent`) dominating the rest of the samples on macOS. That
+GC share is the platform caveat above: re-profile on Linux before ranking any
+further work.
