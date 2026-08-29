@@ -42,7 +42,7 @@ Source files in the surf package — feature → file map:
 | `state.go` | `reqState` — pooled-context-value carrier for the standard path |
 | `ctx.go` | `Context`, `CtxHandler`, `CtxMiddleware`, `CtxService[T]` — the opt-in fast path |
 | `response.go` | `ResponseWriter` wrapper (`Hijack`/`Flush`/`Push`/`WriteString`) |
-| `context.go` | `contextKey` type (still used by `RequestIDMiddleware` and `Get` fallback) |
+| `context.go` | `contextKey` type — the unexported key type all request storage is filed under |
 | `errors.go` | `Abort`, `HTTPError`, `ErrorRenderer`, `DefaultErrorRenderer` |
 | `render.go` | `JSON`, `JSONData`, `JSONList`, `JSONError` envelope helpers |
 | `binding.go` | `Bind`, `BindWithLimit`, `BindAndValidate`, `Validator` |
@@ -51,7 +51,7 @@ Source files in the surf package — feature → file map:
 | `metrics.go` | `MetricsRegistry` — Prometheus text exposition, no deps |
 | `websocket.go` | RFC 6455 `Upgrade`, `WSConn`, same-origin policy by default |
 | `middleware.go` | CORS, Recovery, RateLimit, Timeout, Gzip |
-| `logger.go` | Request logging (template + structured) and the global `requestStorage` map |
+| `logger.go` | Request logging (template + structured) and the context-backed `Set`/`Store`/`Get` request storage |
 | `ip.go` | `IPFromRequest`, `KeyByIP`, trusted-proxy CIDR handling |
 | `match.go` | `matchGlob` / `matchAnyGlob` for route-pattern globs |
 | `helpers.go` | Query helpers, redirects, `App.Static` / `App.StaticFile` |
@@ -260,11 +260,20 @@ CI/check rules:
    `HandlerFunc`.** The function's `r` is passed by value, so reassignments
    don't propagate to later before/after handlers. Per-route `Middleware`
    (the `http.Handler`-based kind) propagates context normally — use that
-   when you need to attach values.
-7. **`Set`/`Get` (the global request-storage map in `logger.go`)** keys by
-   `*http.Request` pointer and is shared process-wide. It's the workaround
-   for #6, kept for backward compatibility. Prefer per-route `Middleware` +
-   `r.WithContext` for new code.
+   when you need to attach values. From a `HandlerFunc`, `surf.Store(r, …)`
+   attaches to the request in place, which does propagate.
+7. **`Set` rebinds your request; you must pass the rebound one on.**
+   `Set(&r, …)` replaces `*r` with a request whose context carries the value.
+   A middleware that calls `Set(&r, …)` and then `next.ServeHTTP(w, origR)`
+   throws the value away. (This storage used to be a package-level map keyed
+   by the `*http.Request` POINTER; a downstream `r.WithContext` then hid every
+   value from the handlers that needed it, silently. It is context-backed
+   now — see `Set`/`Store`/`Get` in `logger.go` and
+   `request_storage_test.go`.)
+8. **`Store` mutates the request in place.** It has no pointer to rebind, so
+   it swaps the context inside the `*http.Request` you hand it. That is safe
+   in the single goroutine net/http gives each request, and only there — do
+   not call it on a request another goroutine is reading.
 
 ---
 
@@ -320,7 +329,8 @@ These were considered for v0.1.0 and explicitly punted; consult before
 attempting them:
 
 - **Context propagation across the `HandlerFunc` chain** — needs a signature
-  change. Its own future release.
+  change. Its own future release. (`Set`/`Store` now propagate through the
+  request's context, which covers the common case.)
 - **CORS default tightening** — downstream config concern.
 - **Param naming with distinct names per branch** — inherent to radix
   routers; convention (`:id` everywhere) is the answer.

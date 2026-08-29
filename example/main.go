@@ -21,7 +21,8 @@ func main() {
 	app.Before(func(w http.ResponseWriter, r *http.Request) error {
 		// Simulate auth check
 		if auth := r.Header.Get("Authorization"); auth != "" {
-			// Workaround: set directly in global storage since framework doesn't preserve context
+			// A Before handler has no pointer to rebind, so Store attaches the
+			// values to r's context in place; handlers downstream see them.
 			surf.Store(r, "user_id", "user-123")
 			surf.Store(r, "user_role", "admin")
 			surf.Store(r, "tenant_id", "tenant-456")
