@@ -11,7 +11,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -19,61 +18,74 @@ import (
 var logTemplateRegex = regexp.MustCompile(`\{([^}]+)\}`)
 
 // Logger context helpers
+//
+// Request-scoped values live in the request's own context.Context, keyed by the
+// unexported contextKey type so no other package can collide with them.
+//
+// This used to be a package-level map[*http.Request]map[string]interface{}, and
+// keying by the request POINTER made it lose values silently: r.WithContext
+// returns a NEW *http.Request, so any middleware that derived a request between
+// the write and the read handed handlers a request the value was not filed
+// under. Get returned nothing and the caller saw a wrong answer rather than an
+// error. A context survives r.WithContext by construction, needs no lock, and
+// is collected together with its request instead of being pinned in a global
+// map until something remembers to call Delete.
 
-// Global storage for request context values with thread safety
-var (
-	requestStorage = make(map[*http.Request]map[string]interface{})
-	storageMutex   sync.RWMutex
-)
-
-// Set adds a value to the request storage (framework limitation workaround)
+// Set attaches a value to the request, visible to every handler downstream.
+//
+// It takes a **http.Request so it can rebind the caller's request to one
+// carrying the value — an http.Request's context is immutable, so a new request
+// is the only way to add to it. Pass the rebound request on:
+//
+//	func auth(next http.Handler) http.Handler {
+//	    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+//	        surf.SetUserID(&r, id)
+//	        next.ServeHTTP(w, r) // r is the rebound request
+//	    })
+//	}
 func Set(r **http.Request, key string, value interface{}) {
-	storageMutex.Lock()
-	defer storageMutex.Unlock()
-
-	if requestStorage[*r] == nil {
-		requestStorage[*r] = make(map[string]interface{})
+	if r == nil || *r == nil {
+		return
 	}
-	requestStorage[*r][key] = value
+	*r = (*r).WithContext(context.WithValue((*r).Context(), contextKey(key), value))
 }
 
-// SetMultiple adds multiple values at once to request storage
+// SetMultiple attaches several values at once, rebinding the caller's request
+// exactly like Set.
 func SetMultiple(r **http.Request, values map[string]interface{}) {
-	storageMutex.Lock()
-	defer storageMutex.Unlock()
-
-	if requestStorage[*r] == nil {
-		requestStorage[*r] = make(map[string]interface{})
+	if r == nil || *r == nil || len(values) == 0 {
+		return
 	}
+	ctx := (*r).Context()
 	for key, value := range values {
-		requestStorage[*r][key] = value
+		ctx = context.WithValue(ctx, contextKey(key), value)
 	}
+	*r = (*r).WithContext(ctx)
 }
 
-// Store directly sets a value for a request (internal use)
+// Store attaches a value to a request the caller cannot rebind — a
+// HandlerFunc's r, or an app-level Before handler's r, where there is no
+// pointer to reassign. It swaps the context inside the *http.Request the caller
+// already holds, so the value is visible to that request and to every
+// r.WithContext copy derived from it afterwards.
+//
+// Prefer Set (or per-route Middleware and r.WithContext) where you can rebind:
+// Store mutates the request in place, so it must not be called on a request
+// another goroutine is reading concurrently. Within a single request-handling
+// goroutine — the only place net/http hands you a request — that is safe.
 func Store(r *http.Request, key string, value interface{}) {
-	storageMutex.Lock()
-	defer storageMutex.Unlock()
-
-	if requestStorage[r] == nil {
-		requestStorage[r] = make(map[string]interface{})
+	if r == nil {
+		return
 	}
-	requestStorage[r][key] = value
+	*r = *r.WithContext(context.WithValue(r.Context(), contextKey(key), value))
 }
 
-// Get retrieves a value from the request storage or context
+// Get retrieves a value previously attached to the request by Set, SetMultiple
+// or Store. The second return reports whether the key was present.
 func Get(r *http.Request, key string) (interface{}, bool) {
-	// First check our global storage with read lock
-	storageMutex.RLock()
-	if storage, exists := requestStorage[r]; exists {
-		if val, ok := storage[key]; ok {
-			storageMutex.RUnlock()
-			return val, true
-		}
+	if r == nil {
+		return nil, false
 	}
-	storageMutex.RUnlock()
-
-	// Fallback to context
 	val := r.Context().Value(contextKey(key))
 	return val, val != nil
 }
@@ -88,12 +100,20 @@ func GetString(r *http.Request, key string, defaultVal string) string {
 	return defaultVal
 }
 
-// Delete removes a request from storage
-func Delete(r *http.Request) {
-	storageMutex.Lock()
-	defer storageMutex.Unlock()
-	delete(requestStorage, r)
-}
+// Delete is retained for source compatibility and does nothing.
+//
+// It used to evict the request's entry from the package-level storage map, and
+// was the only thing that stopped that map growing without bound. There is no
+// such map any more: values live in the request's context and are collected
+// with the request, so there is nothing to release. Existing callers — the
+// `defer surf.Delete(r)` this package's own logging middleware used to carry,
+// and any a consumer wrote — keep compiling and behaving correctly.
+//
+// A context cannot have a value removed from it, so this cannot be made to
+// delete anything; that is deliberate, not an oversight.
+//
+// Deprecated: request storage is freed automatically with the request.
+func Delete(r *http.Request) {}
 
 // GetInt retrieves an int value with a default
 func GetInt(r *http.Request, key string, defaultVal int) int {
@@ -361,53 +381,39 @@ func formatLog(template string, entry *LogEntry) string {
 	})
 }
 
-// loggerStartTimes provides thread-safe storage for request start times
-type loggerStartTimes struct {
-	mu    sync.RWMutex
-	times map[*http.Request]time.Time
-}
+// startTimeKey is the request-storage key under which LoggerMiddleware records
+// when a request began, for LoggerAfter to read.
+const startTimeKey = "surf.start_time"
 
-func newLoggerStartTimes() *loggerStartTimes {
-	return &loggerStartTimes{
-		times: make(map[*http.Request]time.Time),
+// requestStartTime returns the start time LoggerMiddleware recorded on r.
+func requestStartTime(r *http.Request) (time.Time, bool) {
+	if v, ok := Get(r, startTimeKey); ok {
+		if t, ok := v.(time.Time); ok {
+			return t, true
+		}
 	}
+	return time.Time{}, false
 }
 
-func (l *loggerStartTimes) set(r *http.Request, t time.Time) {
-	l.mu.Lock()
-	l.times[r] = t
-	l.mu.Unlock()
-}
-
-func (l *loggerStartTimes) getAndDelete(r *http.Request) (time.Time, bool) {
-	l.mu.Lock()
-	defer l.mu.Unlock()
-	t, ok := l.times[r]
-	if ok {
-		delete(l.times, r)
-	}
-	return t, ok
-}
-
-// LoggerMiddleware creates a simple After middleware for logging
-// Since the framework doesn't propagate context changes from Before middlewares,
-// we'll use a global map to track start times by request
+// LoggerMiddleware records the request's start time for LoggerAfter to report.
+// Use it as a Before handler, with LoggerAfter as the matching After handler.
+//
+// The start time is stored on the request itself. It used to live in a
+// map[*http.Request]time.Time owned by this closure, which was wrong twice
+// over: LoggerAfter constructed its OWN map and so never found the entry (every
+// latency it logged was ~0), and nothing ever drained LoggerMiddleware's map, so
+// each request stayed reachable for the life of the process.
 func LoggerMiddleware(format string) HandlerFunc {
-	startTimes := newLoggerStartTimes()
-
-	// This should be used as a Before middleware
 	return func(w http.ResponseWriter, r *http.Request) error {
-		startTimes.set(r, time.Now())
+		Store(r, startTimeKey, time.Now())
 		return nil
 	}
 }
 
 // LoggerAfter creates the After middleware for logging
 func LoggerAfter(format string) HandlerFunc {
-	startTimes := newLoggerStartTimes()
-
 	return func(w http.ResponseWriter, r *http.Request) error {
-		start, ok := startTimes.getAndDelete(r)
+		start, ok := requestStartTime(r)
 		if !ok {
 			start = time.Now()
 		}
@@ -433,9 +439,6 @@ func LoggerAfter(format string) HandlerFunc {
 // SimpleLogger creates just an After middleware for logging (no Before needed)
 func SimpleLogger(format string) HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) error {
-		// Always clean up request storage, even on early returns
-		defer Delete(r)
-
 		// Get the ResponseWriter from context
 		rw := GetResponseWriter(r)
 		if rw == nil {
@@ -460,9 +463,6 @@ func SimpleLogger(format string) HandlerFunc {
 func LoggingMiddleware(format string) Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Always clean up request storage
-			defer Delete(r)
-
 			// Wrap the response writer
 			rw := NewResponseWriter(w)
 			rw.StartTime = time.Now()
@@ -491,8 +491,7 @@ type LoggingConfig struct {
 	Format string
 
 	// SkipPaths lists request paths excluded from logging. A path ending in
-	// "*" matches by prefix (e.g. "/health/*"); others match exactly. Skipped
-	// requests still have their global request storage cleaned up.
+	// "*" matches by prefix (e.g. "/health/*"); others match exactly.
 	SkipPaths []string
 }
 
@@ -507,9 +506,6 @@ func LoggingMiddlewareWithConfig(config LoggingConfig) Middleware {
 
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Always clean up request storage, even for skipped paths.
-			defer Delete(r)
-
 			if matchAnyGlob(r.URL.Path, skip) {
 				next.ServeHTTP(w, r)
 				return
@@ -535,9 +531,6 @@ func LoggingMiddlewareWithConfig(config LoggingConfig) Middleware {
 func Logger(format string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// Always clean up request storage
-			defer Delete(r)
-
 			start := time.Now()
 
 			// Wrap response writer to capture status and size

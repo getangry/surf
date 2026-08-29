@@ -340,13 +340,17 @@ func GetService[T any](r *http.Request, key any) T
 
 ## Request Context Storage
 
+Values live in the request's own `context.Context`, keyed by an unexported key
+type. They therefore survive any `r.WithContext(...)` performed by a downstream
+middleware, and are garbage-collected with the request.
+
 ```go
 // Basic storage (uses *http.Request directly)
 func Store(r *http.Request, key string, value interface{})
 func Get(r *http.Request, key string) (interface{}, bool)
 func GetString(r *http.Request, key string, defaultVal string) string
 func GetInt(r *http.Request, key string, defaultVal int) int
-func Delete(r *http.Request)
+func Delete(r *http.Request) // retained no-op; nothing needs freeing
 func MustGet(r *http.Request, key string) interface{}
 
 // Pointer-based storage (for modifying request)

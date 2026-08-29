@@ -406,17 +406,40 @@ app.UseFunc(func(w http.ResponseWriter, r *http.Request, next http.HandlerFunc) 
 
 ## Request Context Storage
 
-Store and retrieve data in request context:
+Values are attached to the request's own `context.Context`, so they travel with
+the request through any `r.WithContext(...)` a downstream middleware performs.
+
+From a middleware, use `Set` — it takes a `**http.Request` so it can rebind your
+request to one carrying the value. **Pass the rebound request on:**
 
 ```go
-// Store data
-surf.Store(r, "user_id", "123")
-surf.Store(r, "operation", "create_user")
-
-// Retrieve data
-userID := surf.Get(r, "user_id").(string)
-operation := surf.GetString(r, "operation")
+func auth(next http.Handler) http.Handler {
+    return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+        surf.SetUserID(&r, "user-123")
+        surf.Set(&r, "tenant_id", "tenant-456")
+        next.ServeHTTP(w, r) // r is the rebound request
+    })
+}
 ```
+
+From a `HandlerFunc` or a `Before`/`After` handler, where there is no pointer to
+rebind, use `Store` — it attaches the value to the request you were handed:
+
+```go
+surf.Store(r, "operation", "create_user")
+```
+
+Read from anywhere downstream:
+
+```go
+userID := surf.GetUserID(r)
+operation := surf.GetString(r, "operation", "")
+if v, ok := surf.Get(r, "tenant_id"); ok { /* ... */ }
+```
+
+`surf.Delete(r)` is retained as a no-op for source compatibility. Nothing needs
+freeing: these values live in the request's context and are collected with the
+request.
 
 ## v0.1.0 Features
 
