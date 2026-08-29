@@ -86,6 +86,55 @@ All notable changes to Surf are documented in this file.
   other in `$defs`/`components.schemas`, leaving `$ref`s pointing at the wrong
   schema; later arrivals are now qualified with their package name.
 
+### Request storage (`Set` / `Store` / `Get`)
+
+#### Fixed
+
+- **Request-scoped values no longer disappear when a middleware calls
+  `r.WithContext`.** Storage was a package-level
+  `map[*http.Request]map[string]interface{}` keyed by the request **pointer**.
+  `r.WithContext(...)` returns a *new* `*http.Request`, so any middleware that
+  derived a request between the write and the read handed handlers a request the
+  value was not filed under: `Get` returned nothing and the caller saw a **wrong
+  answer, not an error**. In production this made an authenticated user's id
+  vanish downstream of the auth middleware, and roughly fifty endpoints told
+  signed-in users they were not members of their own organization.
+
+  Values now live in the request's own `context.Context` under the unexported
+  `contextKey` type, which `r.WithContext` preserves by construction. The
+  signatures are unchanged: `Set` already took `**http.Request`, so it rebinds
+  the caller's request to one carrying the value — **pass the rebound request
+  on** (`surf.Set(&r, …); next.ServeHTTP(w, r)`).
+- **The storage no longer leaks a whole `*http.Request` per request.** The only
+  cleanup was a `defer Delete(r)` inside this package's *logging* middleware, so
+  an application that used `Set`/`Store` without wiring that middleware pinned
+  every request — headers, context and body — for the life of the process. And
+  where the pointer had diverged, `Delete` could not free the entry anyway.
+  Contexts are collected with their request; there is nothing left to leak.
+- **`LoggerMiddleware` / `LoggerAfter` report a real latency, and stop leaking.**
+  The start time lived in a second `map[*http.Request]time.Time`, one instance
+  per closure — so `LoggerAfter` looked in a map `LoggerMiddleware` had never
+  written to (every latency it logged was ~0), and nothing ever drained
+  `LoggerMiddleware`'s map. The start time now rides on the request.
+- `Get`, `Store` and `Delete` no longer panic on a nil `*http.Request`.
+
+#### Changed
+
+- **`Store` attaches to the request in place** rather than to a global map,
+  which is what makes its value visible to later `r.WithContext` copies. It must
+  not be called on a request another goroutine is reading concurrently — safe
+  in the single goroutine net/http gives each request, and only there. Prefer
+  `Set` (or per-route `Middleware` + `r.WithContext`) where you can rebind.
+- No lock is taken on any read or write; there is no shared state left to guard.
+  `Set`/`Store` now allocate a context node per call (and `Get` boxes its key),
+  where the map cost a mutex instead.
+
+#### Deprecated
+
+- **`Delete(r)` is a retained no-op.** It is still exported so existing callers
+  compile and behave correctly, but a `context.Context` cannot have a value
+  removed from it and there is no longer any process-global state to release.
+
 ### Logging (`pkg/logger/reef`)
 
 #### Performance

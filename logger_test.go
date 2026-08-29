@@ -39,11 +39,14 @@ func TestRequestStorage(t *testing.T) {
 		t.Error("missing should not exist")
 	}
 
-	// Delete
+	// Delete used to evict the request's entry from the package-level storage
+	// map, and this block asserted that it did. That map is gone: values live
+	// in the request's own context, which cannot have a value removed from it.
+	// Delete is retained as an exported no-op so existing callers keep
+	// compiling — see TestDeleteIsRetainedNoOp for the contract it now has.
 	Delete(req)
-	_, ok = Get(req, "key1")
-	if ok {
-		t.Error("key1 should be deleted")
+	if _, ok = Get(req, "key1"); !ok {
+		t.Error("key1 should survive Delete (retained no-op)")
 	}
 }
 
@@ -485,36 +488,14 @@ func TestLoggerFromRequest(t *testing.T) {
 	Delete(req)
 }
 
-func TestStorageConcurrency(t *testing.T) {
-	req := httptest.NewRequest("GET", "/test", nil)
-
-	done := make(chan bool)
-
-	// Concurrent writes
-	for i := 0; i < 100; i++ {
-		go func(n int) {
-			Store(req, "key", n)
-			done <- true
-		}(i)
-	}
-
-	// Wait for writes
-	for i := 0; i < 100; i++ {
-		<-done
-	}
-
-	// Concurrent reads
-	for i := 0; i < 100; i++ {
-		go func() {
-			Get(req, "key")
-			done <- true
-		}()
-	}
-
-	// Wait for reads
-	for i := 0; i < 100; i++ {
-		<-done
-	}
-
-	Delete(req)
-}
+// TestStorageConcurrency used to live here. It had 100 goroutines Store into
+// ONE *http.Request and 100 more Get from it, which tested the mutex on the
+// package-level storage map — a lock that only existed because the map was
+// process-global. With values in the request's own context there is no shared
+// map and no lock, and Store writes to the request the caller handed it, so
+// concurrent writers to a single request are no longer supported (net/http
+// serves each request from one goroutine; *http.Request has never been safe to
+// mutate concurrently). The property that actually matters — concurrent
+// requests never see each other's values, and one request's values are safe to
+// read from many goroutines — is asserted by
+// TestConcurrentRequestsAreIsolated in request_storage_test.go.
